@@ -69,8 +69,8 @@ fi
 # Use one block while layouts match; split into per-variant if blocks when rotations or chips differ (see zeroone/x6).
 # if ver hwtypecmp PixNova000 PixNova001
 # then
-icm45686 -b 3 -s -R 0 start
-icm45686 -b 2 -s -R 0 start
+adis16470 -b 2 -s -R 0 start
+iim42652 -b 3 -s -R 0 start
 icm45686 -b 1 -s -R 8 start
 # fi
 

@@ -12,6 +12,7 @@
         "C_Cpp.vcpkg.enabled": false,
         "C_Cpp.workspaceParsingPriority": "low",
         "cmake.buildBeforeRun": true,
+        "cmake.launchTarget": "px4",
         "cmake.buildDirectory": "${workspaceFolder}/build/${variant:CONFIG}",
         "cmake.configureOnOpen": true,
         "cmake.ctest.parallelJobs": 1,
