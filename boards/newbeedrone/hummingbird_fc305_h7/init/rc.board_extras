@@ -1,0 +1,14 @@
+#!/bin/sh
+#
+# Hummingbird FC305 H7 board extras
+#-------------------------------------------------------------------------------
+
+# MAX7456 analog OSD on SPI4. Set OSD_ATXXXX_CFG to 1 (NTSC) or 2 (PAL).
+if ! param compare OSD_ATXXXX_CFG 0
+then
+	atxxxx start -s
+fi
+
+# DShot ESC serial telemetry on the dedicated UART2 return line.
+# This is separate from bidirectional DShot telemetry on the motor signal pins.
+dshot telemetry -d /dev/ttyS1

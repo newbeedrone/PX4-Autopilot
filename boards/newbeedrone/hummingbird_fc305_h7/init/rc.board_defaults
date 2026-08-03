@@ -1,0 +1,39 @@
+#!/bin/sh
+#
+# board specific defaults
+#------------------------------------------------------------------------------
+
+neopixel start
+
+# Battery 1: voltage PC0, current PC1
+# Battery 2: voltage PB1, current PB0
+# Both voltage inputs use a 100k/10k divider. Betaflight scale 800 is 80 mV/A,
+# which corresponds to 12.5 A/V in PX4.
+param set-default BAT1_V_DIV 11.0
+param set-default BAT2_V_DIV 11.0
+param set-default BAT1_A_PER_V 12.5
+param set-default BAT2_A_PER_V 12.5
+param set-default BAT1_SOURCE 0
+param set-default BAT2_SOURCE 0
+
+# system_power unavailable
+param set-default CBRK_SUPPLY_CHK 894281
+
+# use EKF2 without mag
+param set-default SYS_HAS_MAG 0
+# and enable gravity fusion
+param set-default EKF2_IMU_CTRL 7
+
+param set-default IMU_GYRO_RATEMAX 2000
+
+# Independent receiver drivers: CRSF on UART5 and SBUS on UART4.
+param set-default RC_CRSF_PRT_CFG 300
+param set-default RC_CRSF_TEL_EN 1
+param set-default RC_SBUS_PRT_CFG 401
+
+# UART8 (/dev/ttyS7) is the secondary GPS port.
+param set-default GPS_2_CONFIG 202
+
+# UART7 (/dev/ttyS6) is the MSP DisplayPort interface for digital-video OSD.
+# TEL4 is only its logical PX4 serial-port slot; it is not a telemetry connector.
+param set-default MSP_OSD_CONFIG 104

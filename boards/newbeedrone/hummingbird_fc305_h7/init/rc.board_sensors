@@ -1,0 +1,16 @@
+#!/bin/sh
+#
+# Hummingbird FC305 H7 board sensor initialization
+#-------------------------------------------------------------------------------
+
+board_adc start
+
+# Internal ICM42688P on SPI1. TIM1_CH1 supplies a 32.051 kHz CLKIN.
+# The sensor axes are already aligned with the PX4 body frame (rotation 0).
+icm42688p -s -b 1 -R 0 -C 32051 start
+
+# Internal SPL06 on I2C2 (address 0x76 / 118).
+spl06 -I -b 2 -a 118 start
+
+# There is no onboard magnetometer. I2C1 remains available for an optional
+# external compass, which can be enabled for the actual fitted sensor model.
