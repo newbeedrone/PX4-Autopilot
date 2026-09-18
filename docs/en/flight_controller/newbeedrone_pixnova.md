@@ -5,8 +5,7 @@ PX4 does not manufacture this (or any) autopilot.
 Contact NewBeeDrone for hardware support or compliance issues.
 :::
 
-The _NewBeeDrone PixNova_ is a modular flight controller built around an STM32H753 FMU processor and an STM32F100 I/O processor.
-It provides redundant onboard sensors and a broad range of interfaces for PX4-powered vehicles.
+The NewBeeDrone PixNova is a high-performance autopilot engineered for complex environments. Featuring a dual-processor architecture with an FMU and an I/O processor, alongside an integrated multi-sensor system, it delivers both precise control and exceptional reliability.
 
 ![NewBeeDrone PixNova flight controller](../../assets/flight_controller/newbeedrone_pixnova/pixnova_product.jpg)
 
