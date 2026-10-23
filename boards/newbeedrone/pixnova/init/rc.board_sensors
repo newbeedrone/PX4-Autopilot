@@ -73,8 +73,8 @@ then
 	icm45686 -b 1 -s -R 8 start
 fi
 
-# Internal magnetometer on I2C4
-ist8310 -I -b 4 -a 0x0c -R 12 start
+# Internal BMM150 on I2C4: +X forward, +Y left, +Z up (ROTATION_ROLL_180)
+bmm150 -I -b 4 -a 0x10 -R 8 start
 
 # External compass on GPS1/I2C1 (the 3rd external bus): standard Holybro Pixhawk 4 or CUAV V5 GPS/compass puck (with lights, safety button, and buzzer)
 ist8310 -X -b 1 -R 10 start
