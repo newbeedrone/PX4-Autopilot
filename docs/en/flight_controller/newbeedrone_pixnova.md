@@ -19,7 +19,7 @@ This flight controller is [manufacturer supported](../flight_controller/autopilo
 - **I/O processor:** STM32F100
 - **IMUs:** 3x ICM-45686
 - **Barometers:** ICP-20100 and BMP388
-- **Magnetometer:** IST8310
+- **Magnetometer:** BMM150
 - **Interfaces:**
   - 16 PWM outputs (8 FMU and 8 I/O)
   - 3 telemetry ports
