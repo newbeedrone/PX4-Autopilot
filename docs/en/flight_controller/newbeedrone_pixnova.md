@@ -159,10 +159,10 @@ Follow [CRSF Telemetry](../telemetry/crsf_telemetry.md) for wiring and the requi
 | -------------------- | ------------------- |
 | `POWER1` / `POWER2`  | 3.8–5.8 V           |
 | USB                  | 4.75–5.25 V         |
-| PWM/servo power rail | 0–36 V              |
+| PWM/servo power rail | 0–12 V              |
 
 The PWM/servo rail rating is separate from the flight controller supply rating.
-Select a rail voltage that matches the connected actuators; the 36 V rating does not apply to the PWM signal pins.
+Select a rail voltage that matches the connected actuators; the 12 V rating does not apply to the PWM signal pins.
 
 ### Power Protection
 
