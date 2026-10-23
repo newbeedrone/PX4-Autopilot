@@ -52,7 +52,7 @@ The I/O baseboard provides a broad set of interfaces for connecting external per
 | FMU board | IMU            | 1 × TDK ICM-45686 |
 | FMU board | Barometer      | ICP-20100         |
 | IMU board | Redundant IMUs | 2 × TDK ICM-45686 |
-| IMU board | Barometer      | BMP390            |
+| IMU board | Barometer      | BMP388            |
 | IMU board | Magnetometer   | BMM150            |
 
 The IMU board includes heating resistors to maintain sensor temperature in cold conditions.
