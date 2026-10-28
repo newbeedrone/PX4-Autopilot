@@ -1,0 +1,4 @@
+#!/bin/sh
+# Factory GPIO testing only. No commander, actuator, sensor or MAVLink apps.
+sercon
+gpio_test start -d /dev/ttyACM0

@@ -51,7 +51,6 @@ if("${PX4_BOARD_LABEL}" STREQUAL  "bootloader")
 else()
 	add_library(drivers_board
 		can.c
-		i2c.cpp
 		init.cpp
 		led.c
 		mtd.cpp
@@ -61,6 +60,13 @@ else()
 		usb.c
 	)
 	add_dependencies(drivers_board arch_board_hw_info)
+	if(NOT CONFIG_GPIO_TEST_RECEIVER)
+		target_sources(drivers_board PRIVATE i2c.cpp)
+	endif()
+	if(CONFIG_SYSTEMCMDS_GPIO_TEST)
+		target_sources(drivers_board PRIVATE gpio_test_board.cpp)
+		target_include_directories(drivers_board PRIVATE ${PX4_SOURCE_DIR}/src/systemcmds/gpio_test)
+	endif()
 
 	target_link_libraries(drivers_board
 		PRIVATE

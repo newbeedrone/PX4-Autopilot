@@ -1,0 +1,513 @@
+{
+  "schematic_sha256": "f796f6503fdacc81fa4cb8a4eb839c0970d5e6a9a09d6c282b6660298513f183",
+  "note": "Logical schematic pin order only. Not a physical connector mating view. Grey pins are outside the GPIO test profile.",
+  "connectors": [
+    {
+      "name": "P15",
+      "pins": [
+        {
+          "number": 1,
+          "nets": [
+            "GND"
+          ]
+        },
+        {
+          "number": 2,
+          "nets": [
+            "UART7_RTS_TELEM1"
+          ]
+        },
+        {
+          "number": 3,
+          "nets": [
+            "UART7_CTS_TELEM1"
+          ]
+        },
+        {
+          "number": 4,
+          "nets": [
+            "UART7_TX_TELEM1"
+          ]
+        },
+        {
+          "number": 5,
+          "nets": [
+            "UART7_RX_TELEM1"
+          ]
+        },
+        {
+          "number": 6,
+          "nets": []
+        }
+      ]
+    },
+    {
+      "name": "P18",
+      "pins": [
+        {
+          "number": 1,
+          "nets": [
+            "GND"
+          ]
+        },
+        {
+          "number": 2,
+          "nets": [
+            "UART5_RTS_TELEM2"
+          ]
+        },
+        {
+          "number": 3,
+          "nets": [
+            "UART5_CTS_TELEM2"
+          ]
+        },
+        {
+          "number": 4,
+          "nets": [
+            "UART5_TX_TELEM2"
+          ]
+        },
+        {
+          "number": 5,
+          "nets": [
+            "UART5_RX_TELEM2"
+          ]
+        },
+        {
+          "number": 6,
+          "nets": []
+        }
+      ]
+    },
+    {
+      "name": "P20",
+      "pins": [
+        {
+          "number": 1,
+          "nets": [
+            "GND"
+          ]
+        },
+        {
+          "number": 2,
+          "nets": [
+            "USART2_RTS_TELEM3"
+          ]
+        },
+        {
+          "number": 3,
+          "nets": [
+            "USART2_CTS_TELEM3"
+          ]
+        },
+        {
+          "number": 4,
+          "nets": [
+            "USART2_TX_TELEM3"
+          ]
+        },
+        {
+          "number": 5,
+          "nets": [
+            "USART2_RX_TELEM3"
+          ]
+        },
+        {
+          "number": 6,
+          "nets": []
+        }
+      ]
+    },
+    {
+      "name": "P19",
+      "pins": [
+        {
+          "number": 1,
+          "nets": [
+            "GND"
+          ]
+        },
+        {
+          "number": 2,
+          "nets": [
+            "BUZZER_1"
+          ]
+        },
+        {
+          "number": 3,
+          "nets": []
+        },
+        {
+          "number": 4,
+          "nets": [
+            "FMU_SAFETY_SW_L"
+          ]
+        },
+        {
+          "number": 5,
+          "nets": [
+            "FMU_SAFETY_SW_IN"
+          ]
+        },
+        {
+          "number": 6,
+          "nets": [
+            "HW_REV_SENSE"
+          ]
+        },
+        {
+          "number": 7,
+          "nets": [
+            "HW_VER_SENSE"
+          ]
+        },
+        {
+          "number": 8,
+          "nets": [
+            "USART1_TX_GPS1"
+          ]
+        },
+        {
+          "number": 9,
+          "nets": [
+            "USART1_RX_GPS1"
+          ]
+        },
+        {
+          "number": 10,
+          "nets": []
+        }
+      ]
+    },
+    {
+      "name": "P3",
+      "pins": [
+        {
+          "number": 1,
+          "nets": [
+            "GND"
+          ]
+        },
+        {
+          "number": 2,
+          "nets": [
+            "I2C4_SDA_FMU"
+          ]
+        },
+        {
+          "number": 3,
+          "nets": [
+            "I2C4_SCL_FMU"
+          ]
+        },
+        {
+          "number": 4,
+          "nets": [
+            "UART8_TX_GPS2"
+          ]
+        },
+        {
+          "number": 5,
+          "nets": [
+            "UART8_RX_GPS2"
+          ]
+        },
+        {
+          "number": 6,
+          "nets": []
+        }
+      ]
+    },
+    {
+      "name": "P17",
+      "pins": [
+        {
+          "number": 1,
+          "nets": [
+            "GND"
+          ]
+        },
+        {
+          "number": 2,
+          "nets": [
+            "NFC_GPIO"
+          ]
+        },
+        {
+          "number": 3,
+          "nets": [
+            "POWER_IN_B"
+          ]
+        },
+        {
+          "number": 4,
+          "nets": [
+            "POWER_IN_A"
+          ]
+        },
+        {
+          "number": 5,
+          "nets": [
+            "UART4_TX_EXT2"
+          ]
+        },
+        {
+          "number": 6,
+          "nets": [
+            "UART4_RX_EXT2"
+          ]
+        },
+        {
+          "number": 7,
+          "nets": []
+        }
+      ]
+    },
+    {
+      "name": "P9",
+      "pins": [
+        {
+          "number": 1,
+          "nets": []
+        },
+        {
+          "number": 2,
+          "nets": [
+            "SPI6_SCK_EXT1"
+          ]
+        },
+        {
+          "number": 3,
+          "nets": [
+            "SPI6_MISO_EXT1"
+          ]
+        },
+        {
+          "number": 4,
+          "nets": [
+            "SPI6_MOSI_EXT1"
+          ]
+        },
+        {
+          "number": 5,
+          "nets": [
+            "SPI6_CS1_EXT1"
+          ]
+        },
+        {
+          "number": 6,
+          "nets": [
+            "SPI6_CS2_EXT1 SWO"
+          ]
+        },
+        {
+          "number": 7,
+          "nets": [
+            "SPIX_SYNC"
+          ]
+        },
+        {
+          "number": 8,
+          "nets": [
+            "SPI6_DRDY1_EXT1"
+          ]
+        },
+        {
+          "number": 9,
+          "nets": [
+            "SPI6_DRDY2_EXT1"
+          ]
+        },
+        {
+          "number": 10,
+          "nets": [
+            "SPI6_RESET_EXT1"
+          ]
+        },
+        {
+          "number": 11,
+          "nets": [
+            "GND"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P13",
+      "pins": [
+        {
+          "number": 1,
+          "nets": []
+        },
+        {
+          "number": 2,
+          "nets": [
+            "FMU_PPM_INPUT"
+          ]
+        },
+        {
+          "number": 3,
+          "nets": [
+            "GND"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P21",
+      "pins": [
+        {
+          "number": 1,
+          "nets": [
+            "FMU_CH8"
+          ]
+        },
+        {
+          "number": 2,
+          "nets": [
+            "FMU_CH7"
+          ]
+        },
+        {
+          "number": 3,
+          "nets": [
+            "FMU_CH6"
+          ]
+        },
+        {
+          "number": 4,
+          "nets": [
+            "FMU_CH5"
+          ]
+        },
+        {
+          "number": 5,
+          "nets": [
+            "FMU_CH4"
+          ]
+        },
+        {
+          "number": 6,
+          "nets": [
+            "FMU_CH3"
+          ]
+        },
+        {
+          "number": 7,
+          "nets": [
+            "FMU_CH2"
+          ]
+        },
+        {
+          "number": 8,
+          "nets": [
+            "FMU_CH1"
+          ]
+        },
+        {
+          "number": 9,
+          "nets": [
+            "GND"
+          ]
+        },
+        {
+          "number": 10,
+          "nets": []
+        }
+      ]
+    },
+    {
+      "name": "P10",
+      "pins": [
+        {
+          "number": 1,
+          "nets": []
+        },
+        {
+          "number": 2,
+          "nets": [
+            "FMU_CAP1"
+          ]
+        },
+        {
+          "number": 3,
+          "nets": [
+            "SEN4_PWR_EN"
+          ]
+        },
+        {
+          "number": 4,
+          "nets": [
+            "SEN4_ADC"
+          ]
+        },
+        {
+          "number": 5,
+          "nets": [
+            "ARMED"
+          ]
+        },
+        {
+          "number": 6,
+          "nets": [
+            "HIPOWER_5V_EN"
+          ]
+        },
+        {
+          "number": 7,
+          "nets": [
+            "HIPOWER_5V_OC"
+          ]
+        },
+        {
+          "number": 8,
+          "nets": [
+            "GND"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "P5",
+      "pins": [
+        {
+          "number": 1,
+          "nets": [
+            "POWER1"
+          ]
+        },
+        {
+          "number": 2,
+          "nets": [
+            "POWER1"
+          ]
+        },
+        {
+          "number": 3,
+          "nets": [
+            "I2C1_SCL_GPS1"
+          ]
+        },
+        {
+          "number": 4,
+          "nets": [
+            "I2C1_SDA_GPS1"
+          ]
+        },
+        {
+          "number": 5,
+          "nets": [
+            "GND"
+          ]
+        },
+        {
+          "number": 6,
+          "nets": [
+            "GND"
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -76,6 +76,10 @@
 #include <px4_platform/board_determine_hw_info.h>
 #include <px4_platform/board_dma_alloc.h>
 
+#if defined(CONFIG_SYSTEMCMDS_GPIO_TEST)
+#include "gpio_test.hpp"
+#endif
+
 /****************************************************************************
  * Pre-Processor Definitions
  ****************************************************************************/
@@ -141,6 +145,12 @@ __EXPORT void board_peripheral_reset(int ms)
  ************************************************************************************/
 __EXPORT void board_on_reset(int status)
 {
+#if defined(CONFIG_SYSTEMCMDS_GPIO_TEST)
+	// Both roles remain inputs until the checked START command enables a source.
+	gpio_test_initialize_inputs();
+	return;
+#endif
+
 	for (int i = 0; i < DIRECT_PWM_OUTPUT_CHANNELS; ++i) {
 		px4_arch_configgpio(io_timer_channel_get_gpio_output(i));
 	}
@@ -168,6 +178,11 @@ __EXPORT void board_on_reset(int status)
 extern "C" __EXPORT void
 stm32_boardinitialize(void)
 {
+#if defined(CONFIG_GPIO_TEST_RECEIVER)
+	gpio_test_initialize_inputs();
+	stm32_usbinitialize();
+	return;
+#endif
 	board_on_reset(-1); /* Reset PWM first thing */
 
 	/* configure LEDs */
@@ -177,7 +192,17 @@ stm32_boardinitialize(void)
 	/* configure pins */
 
 	const uint32_t gpio[] = PX4_GPIO_INIT_LIST;
+#if defined(CONFIG_SYSTEMCMDS_GPIO_TEST)
+
+	for (const uint32_t config : gpio) {
+		if (!gpio_test_contains_pin(config)) {
+			px4_arch_configgpio(config);
+		}
+	}
+
+#else
 	px4_gpio_init(gpio, arraySize(gpio));
+#endif
 
 	/* configure USB interfaces */
 
@@ -215,6 +240,11 @@ stm32_boardinitialize(void)
 __EXPORT int board_app_initialize(uintptr_t arg)
 {
 #if !defined(BOOTLOADER)
+#if defined(CONFIG_GPIO_TEST_RECEIVER)
+	px4_platform_init();
+	board_dma_alloc_init();
+	return OK;
+#endif
 
 	/* Power on Interfaces */
 	VDD_3V3_SD_CARD_EN(true);
@@ -267,16 +297,20 @@ __EXPORT int board_app_initialize(uintptr_t arg)
 	led_on(LED_GREEN); // Indicate Power.
 	led_off(LED_BLUE);
 
+#if !defined(CONFIG_SYSTEMCMDS_GPIO_TEST)
+
 	if (board_hardfault_init(2, true) != 0) {
 		led_on(LED_RED);
 	}
+
+#endif
 
 	// Ensure Power is off for > 10 mS
 	usleep(15 * 1000);
 	VDD_3V3_SD_CARD_EN(true);
 	usleep(500 * 1000);
 
-#  ifdef CONFIG_MMCSD
+#  if defined(CONFIG_MMCSD) && !defined(CONFIG_SYSTEMCMDS_GPIO_TEST)
 	int ret = stm32_sdio_initialize();
 
 	if (ret != OK) {

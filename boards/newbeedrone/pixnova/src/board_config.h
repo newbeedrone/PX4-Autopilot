@@ -312,7 +312,9 @@
 #define HRT_TIMER               8  /* use timer8 for the HRT */
 #define HRT_TIMER_CHANNEL       3  /* use capture/compare channel 3 */
 
+#if !defined(CONFIG_SYSTEMCMDS_GPIO_TEST)
 #define HRT_PPM_CHANNEL         /* T8C1 */  1  /* use capture/compare channel 1 */
+#endif
 #define GPIO_PPM_IN             /* PI5 T8C1 */ GPIO_TIM8_CH1IN_2
 
 /* Some RC protocols are bi-directional, therefore we need a half-duplex UART */

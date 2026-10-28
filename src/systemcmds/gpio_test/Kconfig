@@ -1,0 +1,16 @@
+menuconfig SYSTEMCMDS_GPIO_TEST
+	bool "gpio_test"
+	default n
+	depends on PLATFORM_NUTTX
+	---help---
+		Isolated manufacturing GPIO waveform and frequency measurement tool.
+
+if SYSTEMCMDS_GPIO_TEST
+config GPIO_TEST_RECEIVER
+	bool "Build an input-only measurement endpoint"
+	default n
+
+config GPIO_TEST_PROFILE
+	string "GPIO test wiring profile relative to the repository root"
+	default ""
+endif
