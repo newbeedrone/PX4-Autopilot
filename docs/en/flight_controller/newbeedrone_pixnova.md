@@ -79,7 +79,7 @@ The IMU board includes heating resistors to maintain sensor temperature in cold 
 
 ## Where To Buy {#store}
 
-Contact [NewBeeDrone](https://newbeedrone.com/) for PixNova availability and ordering information.
+Order from [NewBeeDrone](https://newbeedrone.com/collections/all/products/newbeedrone-pixnova-v6x-standard-kit).
 
 ## Assembly And Setup
 
