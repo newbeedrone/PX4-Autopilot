@@ -6,6 +6,13 @@ menuconfig SYSTEMCMDS_GPIO_TEST
 		Isolated manufacturing GPIO waveform and frequency measurement tool.
 
 if SYSTEMCMDS_GPIO_TEST
+config GPIO_TEST_PROTOCOLS
+	bool "Enable isolated connector protocol tests"
+	default n
+	---help---
+		I2C slave simulation, UART receiver simulation, external CAN pairing,
+		and Ethernet UDP checks. Requires the matching board adapter and GUI.
+
 config GPIO_TEST_RECEIVER
 	bool "Build an input-only measurement endpoint"
 	default n

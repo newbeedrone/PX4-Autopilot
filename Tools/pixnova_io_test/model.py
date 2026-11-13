@@ -14,6 +14,8 @@ class Result:
     streak: int = 0
     sequence: int = 0
     received_at: float = 0
+    voltage_low_mv: int | None = None
+    voltage_high_mv: int | None = None
 
 
 class Assessment:
@@ -36,6 +38,8 @@ class Assessment:
             return False
         index, sequence = frame.get("channel"), frame.get("seq")
         if type(index) is not int or not 0 <= index < len(self.results):
+            return False
+        if self.profile["channels"][index].get("method") == "adc_voltage":
             return False
         result = self.results[index]
         if type(sequence) is not int or not 1 <= sequence <= 0xffffffff or sequence <= result.sequence:
@@ -69,7 +73,13 @@ class Assessment:
         error = (frequency - expected) / expected * 100
         result.frequency_hz, result.error_percent = frequency, error
         if not math.isfinite(error) or abs(error) > self.profile["tolerance_percent"]:
-            self._fail(result, "Frequency outside tolerance; check wiring")
+            reason = "Frequency outside tolerance; check wiring"
+            matches = [row["id"] for i, row in enumerate(self.profile["channels"])
+                       if i != index and "expected_hz" in row and abs(frequency - row["expected_hz"]) / row["expected_hz"] * 100
+                       <= self.profile["tolerance_percent"]]
+            if matches:
+                reason += "; matches " + ", ".join(matches) + " frequency"
+            self._fail(result, reason)
             return True
         result.streak = 1 if gap else result.streak + 1
         result.status = "PASS" if result.streak >= self.profile["required_windows"] else "VERIFYING"
@@ -82,7 +92,9 @@ class Assessment:
 
     def expire(self, now=None, timeout=2.5):
         now = time.monotonic() if now is None else now
-        for result in self.results:
+        for row, result in zip(self.profile["channels"], self.results):
+            if row.get("method") == "adc_voltage":
+                continue
             last_seen = result.received_at if result.sequence else self.started_at
             if last_seen is not None and now - last_seen > timeout:
                 self._fail(result, "Measurement timeout")
@@ -93,4 +105,5 @@ class Assessment:
 
     @property
     def all_passed(self):
-        return bool(self.results) and all(row.status == "PASS" for row in self.results)
+        return bool(self.results) and all(result.status == "PASS" for row, result in zip(self.profile["channels"], self.results)
+                                         if row.get("method") != "adc_voltage")

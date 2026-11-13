@@ -30,6 +30,8 @@
 #define GPIO_INPUT 0u
 #define GPIO_PUSHPULL 0u
 #define GPIO_FLOAT 0u
+#define GPIO_PULLUP 0x200u
+#define GPIO_PULLDOWN 0x400u
 #define GPIO_SPEED_2MHz 0x100u
 #define GPIO_OUTPUT_CLEAR 0u
 
@@ -37,6 +39,7 @@ using hrt_abstime = uint64_t;
 using irqstate_t = unsigned;
 static hrt_abstime test_now = 1000;
 static bool test_board_ok = true;
+static bool test_external_ok = true;
 static int test_bad_pin = -1;
 static unsigned test_read_cost_us = 0;
 static std::array<uint32_t, 256> test_modes{};
@@ -95,3 +98,19 @@ inline bool board_gpio_test_self_check(GpioTestReport report, void *context, boo
 	return test_board_ok;
 }
 inline int test_usleep(useconds_t duration) { test_now += duration; return 0; }
+inline bool board_gpio_test_external_check(GpioTestReport report, void *context, bool gpio_waveform)
+{
+#if !defined(CONFIG_GPIO_TEST_RECEIVER)
+
+	if (gpio_waveform) {
+		report(context, "i2c1_no_attached_devices", test_external_ok, test_external_ok ? 0 : 1);
+		return test_external_ok;
+	}
+
+#else
+	(void)report;
+	(void)context;
+	(void)gpio_waveform;
+#endif
+	return true;
+}

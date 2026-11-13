@@ -122,7 +122,7 @@ class PortMap(tk.Canvas):
         view, station = self.dashboard, self.dashboard.station
         results = station.assessment.results
         signature = (self.winfo_width(), view.filter_group, view.faults_only, view.selected,
-                     tuple((r.status, r.frequency_hz) for r in results))
+                     tuple((r.status, r.frequency_hz, r.voltage_low_mv, r.voltage_high_mv) for r in results))
         if signature == self.signature and not force:
             return
         self.signature = signature
@@ -164,7 +164,8 @@ class PortMap(tk.Canvas):
         self.create_text(x + width - 14, y + 23, text=f"{failed} FAIL" if failed else f"{passed}/{len(indices)}",
                          anchor="e", fill=color, font=(MONO, 9, "bold"))
         connector = channels[indices[0]]["probe_connector"]
-        self.create_text(x + 14, y + 48, text=f"PROBE {connector}  ·  NUMBERED PINS", anchor="w", fill=MUTED, font=(FONT, 8))
+        analog = any(channels[i].get("method") == "adc_voltage" for i in indices)
+        self.create_text(x + 14, y + 48, text=f"PROBE {connector}  ·  " + ("FREQUENCY / ADC" if analog else "GPIO FREQUENCY"), anchor="w", fill=MUTED, font=(FONT, 8))
         positions = view.connectors[connector]["pins"]
         by_pin = {channels[i]["probe_connector_pin"]: i for i in indices}
         gap = 5
@@ -182,9 +183,9 @@ class PortMap(tk.Canvas):
                              font=(MONO, 9, "bold"), tags=tags)
             if index is not None:
                 self.tag_bind(f"pin:{index}", "<Button-1>", lambda _, i=index: self.select_pin(i))
-        self.create_text(x + 14, y + 112, text="SIGNAL", anchor="w", fill=MUTED, font=(FONT, 8))
+        self.create_text(x + 14, y + 112, text="FMU SIGNAL", anchor="w", fill=MUTED, font=(FONT, 8))
         self.create_text(x + width * .49, y + 112, text="FMU → PROBE", fill=MUTED, font=(FONT, 8))
-        self.create_text(x + width - 14, y + 112, text="Hz", anchor="e", fill=MUTED, font=(FONT, 8))
+        self.create_text(x + width - 14, y + 112, text="Hz / V" if analog else "Hz", anchor="e", fill=MUTED, font=(FONT, 8))
         for offset, index in enumerate(indices):
             row, result = channels[index], results[index]
             ry = y + 132 + offset * self.ROW_HEIGHT
@@ -194,9 +195,12 @@ class PortMap(tk.Canvas):
                 rounded(self, x + 7, ry - 12, x + width - 7, ry + 13, radius=5,
                         fill=fill if result.status == "FAIL" else "#1b304d", outline="", tags=(tag,))
             self.create_text(x + 14, ry, text=signal_name(row), anchor="w", fill=fg, font=(FONT, 9), tags=(tag,))
-            self.create_text(x + width * .49, ry, text=f"{row['source_pin']} → {row['probe_pin']}",
+            adc = row.get("method") == "adc_voltage"
+            self.create_text(x + width * .49, ry, text=f"{row['source_pin']} {'←' if adc else '→'} {row['probe_pin']}",
                              fill=fg, font=(MONO, 9), tags=(tag,))
             measured = f"{result.frequency_hz:.2f}" if result.frequency_hz is not None else "—"
+            if adc:
+                measured = f"{result.voltage_high_mv / 1000:.3f} V" if result.voltage_high_mv is not None else "—"
             self.create_text(x + width - 14, ry, text=measured, anchor="e", fill=fg, font=(MONO, 9), tags=(tag,))
             self.tag_bind(tag, "<Button-1>", lambda _, i=index: self.select_pin(i))
 
@@ -243,7 +247,7 @@ class Dashboard:
         protected = tk.Frame(sidebar, bg=SIDEBAR)
         protected.pack(side="bottom", fill="x", padx=20, pady=24)
         label(protected, "SENSOR BUSES", size=8, color=MUTED).pack(anchor="w")
-        label(protected, "I2C2 / I2C3 / I2C4", size=9, color=BLUE).pack(anchor="w", pady=(6, 2))
+        label(protected, "I2C1 / 2 / 3 / 4", size=9, color=BLUE).pack(anchor="w", pady=(6, 2))
         label(protected, "Protected · no waveforms", size=8, color=MUTED).pack(anchor="w")
         body = tk.Frame(root, bg=BG)
         body.pack(side="left", fill="both", expand=True, padx=24, pady=20)
@@ -258,10 +262,12 @@ class Dashboard:
         if self.station.demo:
             label(actions, "DEMO / SIMULATED", color=AMBER, bold=True, size=9).pack(side="left", padx=14)
         Action(actions, "Export report", self.station.export, width=112).pack(side="left", padx=(0, 8))
+        Action(actions, "Protocols", self.station.open_protocols, width=100).pack(side="left", padx=(0, 8))
         Action(actions, "■  Stop", self.station.stop, width=80, danger=True).pack(side="left", padx=(0, 8))
-        Action(actions, "▶  Start test", self.station.start, width=122, primary=True).pack(side="left")
+        Action(actions, "▶  Start test", self.station.start_full_test, width=122, primary=True).pack(side="left")
         self._connections(body)
         self._peripherals(body)
+        self._i2c_tests(body)
         metrics = tk.Frame(body, bg=BG)
         metrics.pack(fill="x", pady=(14, 16))
         for column, (name, caption, color) in enumerate([
@@ -352,6 +358,33 @@ class Dashboard:
         status_row.pack(fill="x")
         self.state_label = label(status_row, variable=self.station.state, color=BLUE, size=9, anchor="w", padx=14, pady=8)
         self.state_label.pack(fill="x")
+
+    def _i2c_tests(self, parent):
+        from protocol_model import TESTS
+        section = tk.Frame(parent, bg=BG)
+        section.pack(fill="x", pady=(12, 0))
+        label(section, "I2C SCL / SDA · SIMULATED SLAVE  |  ADC6V6 · 0 V / 3.3 V STIMULUS", size=9, bold=True).pack(anchor="w")
+        label(section, "UART, buzzer and other digital signals use the GPIO frequency tests below.",
+              size=8, color=MUTED).pack(anchor="w", pady=(2, 0))
+        cards = tk.Frame(section, bg=BG); cards.pack(fill="x", pady=(5, 0))
+        self.i2c_cards = {}
+        for column, (mode, spec) in enumerate((m, s) for m, s in TESTS.items() if s.get("kind") == "i2c"):
+            cards.columnconfigure(column, weight=1, uniform="i2c")
+            box = tk.Frame(cards, bg=PANEL, highlightbackground=BORDER, highlightthickness=1, padx=8, pady=7)
+            box.grid(row=0, column=column, sticky="nsew", padx=3)
+            label(box, spec["name"], size=10, bold=True).pack(anchor="w")
+            state = label(box, "NOT RUN", size=9, color=MUTED); state.pack(anchor="w", pady=3)
+            button = label(box, "Test I2C →", size=9, color=BLUE, cursor="hand2")
+            button.pack(anchor="w")
+            button.bind("<Button-1>", lambda _, name=mode: self.station.start_i2c(name))
+            self.i2c_cards[mode] = (box, state)
+        cards.columnconfigure(6, weight=1, uniform="i2c")
+        self.adc_box = tk.Frame(cards, bg=PANEL, highlightbackground=BORDER, highlightthickness=1, padx=8, pady=7)
+        self.adc_box.grid(row=0, column=6, sticky="nsew", padx=3)
+        label(self.adc_box, "ADIO · ADC6V6", size=10, bold=True).pack(anchor="w")
+        self.adc_state = label(self.adc_box, "NOT RUN", size=9, color=MUTED); self.adc_state.pack(anchor="w", pady=3)
+        button = label(self.adc_box, "Test ADC →", size=9, color=BLUE, cursor="hand2"); button.pack(anchor="w")
+        button.bind("<Button-1>", lambda _: self.station.start_adc())
 
     def _inspector(self, parent):
         canvas = tk.Canvas(parent, bg=PANEL, highlightthickness=0)
@@ -531,11 +564,22 @@ class Dashboard:
                             fg=RED if bad else MUTED, bg=bg)
             title.configure(fg=RED if bad and key is not None else TEXT if selected else MUTED, bg=bg)
             frame.configure(bg=bg)
-        self.map_title.configure(text="Failed port & pin map" if self.faults_only else self.filter_group or "Port & pin map")
+        group_title = "Failed pins" if self.faults_only else self.filter_group or "All ports"
+        self.map_title.configure(text=f"{group_title} · " + ("Frequency / ADC voltage" if self.filter_group in (None, "AD&IO") else "GPIO frequency"))
         for role in ("source", "probe"):
             online = role in self.station.hello
             status = "Demo" if self.station.demo else "Verified" if online else "Offline"
             getattr(self, role + "_status").configure(text="● " + status, fg=AMBER if self.station.demo else GREEN if online else MUTED)
+        for mode, (box, state) in self.i2c_cards.items():
+            result = getattr(self.station, "i2c_results", {}).get(mode, {})
+            status = result.get("status", "NOT RUN")
+            color = GREEN if status == "PASS" else RED if status == "FAIL" else BLUE if status in ("WAITING", "VERIFYING") else MUTED
+            state.configure(text=status, fg=color)
+            box.configure(highlightbackground=color)
+        adc = self.station.adc_summary()
+        color = STATE_COLORS[adc["status"]][0]
+        self.adc_state.configure(text=adc["status"], fg=color)
+        self.adc_box.configure(highlightbackground=color)
         self.map.render()
         self._render_peripherals()
         self._render_inspector()
@@ -546,12 +590,13 @@ class Dashboard:
             return
         row = self.station.profile["channels"][self.selected]
         result = self.station.assessment.results[self.selected]
-        signature = ("pin", self.selected, result.status, result.frequency_hz, result.error_percent, result.streak, result.reason)
+        signature = ("pin", self.selected, result.status, result.frequency_hz, result.error_percent, result.streak, result.reason,
+                     result.voltage_low_mv, result.voltage_high_mv)
         if self._inspector_signature == signature:
             return
         self._inspector_signature = signature
         color, fill = STATE_COLORS[result.status]
-        self.inspector_heading.configure(text="PIN INSPECTOR")
+        self.inspector_heading.configure(text="GPIO FREQUENCY TEST")
         for key, text in [("expected", "Expected"), ("measured", "Measured"), ("error", "Error"), ("window", "Valid windows")]:
             self.detail_labels[key].configure(text=text)
         self.detail_values["expected"].configure(fg=TEXT)
@@ -559,17 +604,30 @@ class Dashboard:
         self.inspector_title.configure(text=row["group"])
         self.inspector_signal.configure(text=f"{signal_name(row)}  /  {row['probe_connector']} pin {row['probe_connector_pin']}")
         self.inspector_badge.configure(text="● " + result.status, fg=color, bg=fill)
-        self.detail_values["expected"].configure(text=f"{row['expected_hz']:.3f} Hz")
+        self.detail_values["expected"].configure(text=f"{row.get('expected_hz', 0):.3f} Hz")
         self.detail_values["measured"].configure(text=f"{result.frequency_hz:.3f} Hz" if result.frequency_hz is not None else "—", fg=color)
         self.detail_values["error"].configure(text=f"{result.error_percent:+.2f}%" if result.error_percent is not None else "—", fg=color)
         self.detail_values["window"].configure(text=f"{min(result.streak, self.station.profile['required_windows'])} / {self.station.profile['required_windows']}")
         self.reason.configure(text=result.reason or "Waiting for startup checks and measurement.", fg=RED if result.status == "FAIL" else MUTED)
         self.pin_note.configure(text=("Signal path failed. Check the source, wiring and probe.\n\n" if result.status == "FAIL" else "") + row["note"])
+        adc = row.get("method") == "adc_voltage"
+        if adc:
+            self.inspector_heading.configure(text="ADC VOLTAGE TEST")
+            for key, text in (("expected", "Low target"), ("measured", "Low readback"), ("error", "High target"), ("window", "High readback")):
+                self.detail_labels[key].configure(text=text)
+            self.detail_values["expected"].configure(text="0.000 V")
+            self.detail_values["measured"].configure(text=f"{result.voltage_low_mv / 1000:.3f} V" if result.voltage_low_mv is not None else "—", fg=color)
+            self.detail_values["error"].configure(text="1.650 V", fg=TEXT)
+            self.detail_values["window"].configure(text=f"{result.voltage_high_mv / 1000:.3f} V" if result.voltage_high_mv is not None else "—", fg=color)
         canvas = self.path
         canvas.delete("all")
         width = 216
-        for y, caption, value, tag in [(2, "PIXNOVA / FMU", row["source_pin"], "source"),
-                                       (72, f"PROBE {row['probe_connector']} · PIN {row['probe_connector_pin']}", row["probe_pin"], "probe")]:
+        path_rows = [(2, "PIXNOVA / FMU", row["source_pin"], "source"),
+                     (72, f"PROBE {row['probe_connector']} · PIN {row['probe_connector_pin']}", row["probe_pin"], "probe")]
+        if adc:
+            path_rows = [(2, "PROBE P10.7 · 0 / 3.3 V", row["probe_pin"], "probe"),
+                         (72, "PIXNOVA ADC1 · INPUT 12", "PC2_C", "source")]
+        for y, caption, value, tag in path_rows:
             rounded(canvas, 1, y, width - 1, y + 42, fill=fill, outline=color, tags=(f"inspector:{tag}",))
             canvas.create_text(13, y + 12, text=caption, anchor="w", fill=MUTED, font=(FONT, 8))
             canvas.create_text(13, y + 29, text=value, anchor="w", fill=color, font=(MONO, 14, "bold"))

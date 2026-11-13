@@ -9,11 +9,23 @@ import zlib
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from build_firmware import build_lock, validate_binary, validate_package, verify_context
+from build_firmware import build_lock, validate_binary, validate_package, validate_startup_config, verify_context, validate_protocol_config
 
 
 class ImageTests(unittest.TestCase):
     digest = "a" * 64
+
+    def test_protocol_config_requires_physical_can_and_idle_uart(self):
+        config = "\n".join(("CONFIG_NETDEV_LATEINIT=y", "CONFIG_STM32H7_FDCAN1=y", "CONFIG_STM32H7_FDCAN2=y",
+                            "CONFIG_FDCAN1_BITRATE=500000", "CONFIG_FDCAN2_BITRATE=500000", "CONFIG_NET_CAN=y",
+                            "CONFIG_STM32H7_I2C_DYNTIMEO_USECPERBYTE=2000"))
+        validate_protocol_config(config, "source")
+        with self.assertRaises(ValueError):
+            validate_protocol_config(config.replace("USECPERBYTE=2000", "USECPERBYTE=500"), "source")
+        for invalid in ("CONFIG_NET_CAN_CANFD=y", "CONFIG_STM32H7_FDCAN_LOOPBACK=y", "CONFIG_STM32H7_USART6=y"):
+            with self.assertRaises(ValueError): validate_protocol_config(config + "\n" + invalid, "source")
+        with self.assertRaises(ValueError): validate_protocol_config("", "source")
+        with self.assertRaises(ValueError): validate_protocol_config("CONFIG_STM32H7_UART8=y", "probe")
 
     def image(self, role="source", stack=0x24008000, reset=None):
         flash = 0x08020000 if role == "source" else 0x08000000
@@ -52,6 +64,18 @@ class ImageTests(unittest.TestCase):
                         dict(package, image="invalid-base64")]:
             with self.assertRaises(ValueError):
                 validate_package(changed, binary, 5900)
+
+    def test_startup_requires_scripts_usb_and_matching_romfs_format(self):
+        config = '\n'.join(f'CONFIG_{name}=y' for name in (
+            "ETC_ROMFS", "NSH_BUILTIN_APPS", "SYSTEM_CDCACM", "CDCACM", "USBDEV", "FS_CROMFS", "ETC_CROMFS"))
+        config += '\nCONFIG_NSH_INITSCRIPT="init.d/rcS"\n'
+        validate_startup_config(config)
+        for name in ("ETC_ROMFS", "NSH_BUILTIN_APPS", "SYSTEM_CDCACM", "CDCACM", "USBDEV", "ETC_CROMFS"):
+            with self.assertRaises(ValueError):
+                validate_startup_config(config.replace(f'CONFIG_{name}=y', f'# CONFIG_{name} is not set'))
+        for extra in ('CONFIG_NSH_DISABLESCRIPT=y', 'CONFIG_NSH_INITSCRIPT="other-script"'):
+            with self.assertRaises(ValueError):
+                validate_startup_config(config + extra)
 
     @unittest.skipUnless(os.name == "posix", "PX4 build helper runs in a POSIX environment")
     def test_concurrent_build_is_rejected_and_lock_is_released(self):

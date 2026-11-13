@@ -288,11 +288,23 @@ bool sdcard_read(GpioTestReport report, void *context)
 }
 #endif
 
+bool board_gpio_test_external_check(GpioTestReport report, void *context, bool gpio_waveform)
+{
+// All I2C pins are outside the GPIO waveform table. Attached I2C devices
+// neither authorize nor block tests of the remaining digital connections.
+	(void)report; (void)context; (void)gpio_waveform;
+	return true;
+}
+
 bool board_gpio_test_self_check(GpioTestReport report, void *context, bool check_external_bus)
 {
 #if defined(CONFIG_GPIO_TEST_RECEIVER)
 	(void)check_external_bus;
+#if defined(CONFIG_GPIO_TEST_PROTOCOLS)
+	report(context, "probe_protocol_firmware", true, 1);
+#else
 	report(context, "probe_input_only_firmware", true, 1);
+#endif
 	return true;
 #else
 	bool ok = sensor_id(report, context, "bmm150_i2c4", 4, BMM150_ADDRESS, 0x40, BMM150_CHIP_ID, true);

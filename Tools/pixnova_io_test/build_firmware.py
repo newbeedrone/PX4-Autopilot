@@ -68,6 +68,20 @@ def validate_binary(data, role, digest):
     return {"flash_address": flash, "initial_stack": stack, "reset_vector": reset}
 
 
+def validate_startup_config(config):
+    settings = dict(line.split("=", 1) for line in config.splitlines() if line.startswith("CONFIG_") and "=" in line)
+    for name in ("ETC_ROMFS", "NSH_BUILTIN_APPS", "SYSTEM_CDCACM", "CDCACM", "USBDEV"):
+        if settings.get("CONFIG_" + name) != "y":
+            raise ValueError(f"Test firmware startup requires CONFIG_{name}=y")
+    if settings.get("CONFIG_NSH_DISABLESCRIPT") == "y" or settings.get("CONFIG_NSH_INITSCRIPT") != '"init.d/rcS"':
+        raise ValueError("Test firmware must execute init.d/rcS")
+    compressed_image = settings.get("CONFIG_FS_CROMFS") == "y"
+    if compressed_image != (settings.get("CONFIG_ETC_CROMFS") == "y"):
+        raise ValueError("Startup mount must match the generated ROMFS image format")
+    if not compressed_image and settings.get("CONFIG_FS_ROMFS") != "y":
+        raise ValueError("Test firmware requires a ROMFS filesystem")
+
+
 def clean_generated_objects(directory):
     # NuttX's in-source archives can survive a configuration change. Remove only
     # ignored, untracked object/archive files; never source or tracked binaries.
@@ -89,9 +103,26 @@ def clean_generated_objects(directory):
     print(f"Cleared {removed} generated NuttX objects in {directory}", flush=True)
 
 
-def build(role, artifact_dir, stamp, digest, revision):
+def validate_protocol_config(config, role):
+    if role == "source":
+        for required in ("CONFIG_NETDEV_LATEINIT=y", "CONFIG_STM32H7_FDCAN1=y", "CONFIG_STM32H7_FDCAN2=y",
+                         "CONFIG_FDCAN1_BITRATE=500000", "CONFIG_FDCAN2_BITRATE=500000", "CONFIG_NET_CAN=y",
+                         "CONFIG_STM32H7_I2C_DYNTIMEO_USECPERBYTE=2000"):
+            if required not in config.splitlines():
+                raise ValueError("Protocol source requires external classic CAN and explicit network startup: " + required)
+        for forbidden in ("CONFIG_NET_CAN_CANFD=y", "CONFIG_STM32H7_FDCAN_LOOPBACK=y", "CONFIG_STM32H7_USART6=y"):
+            if forbidden in config.splitlines():
+                raise ValueError("Unsafe protocol test configuration: " + forbidden)
+    else:
+        for forbidden in ("CONFIG_STM32H7_UART8=y", "CONFIG_STM32H7_ETHMAC=y"):
+            if forbidden in config.splitlines():
+                raise ValueError("Simulator signals must remain undriven until a checked command: " + forbidden)
+
+
+def build(role, artifact_dir, stamp, digest, revision, protocols=False):
     verify_context(digest, revision)
-    target = "newbeedrone_pixnova_" + ("io-test" if role == "source" else "io-probe")
+    label = ("protocol-test" if role == "source" else "protocol-probe") if protocols else ("io-test" if role == "source" else "io-probe")
+    target = "newbeedrone_pixnova_" + label
     for folder in (ROOT / "platforms/nuttx/NuttX/nuttx", ROOT / "platforms/nuttx/NuttX/apps"):
         clean_generated_objects(folder)
     cached = ROOT / "build" / target / "NuttX"
@@ -101,6 +132,10 @@ def build(role, artifact_dir, stamp, digest, revision):
             archive.unlink()
     subprocess.run(["make", target, "-j4"], cwd=ROOT, env=os.environ | {"CCACHE_DISABLE": "1"}, check=True)
     verify_context(digest, revision)
+    config = (ROOT / "build" / target / "NuttX/nuttx/.config").read_text()
+    validate_startup_config(config)
+    if protocols:
+        validate_protocol_config(config, role)
     head = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, text=True).strip()
     dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT))
     outputs = []
@@ -109,6 +144,14 @@ def build(role, artifact_dir, stamp, digest, revision):
     if not package.is_file():
         raise FileNotFoundError(package)
     binary = (ROOT / "build" / target / (target + ".bin")).read_bytes()
+    if b'"independent_external_checks":1' not in binary:
+        raise ValueError("Firmware is missing independent external check capability")
+    if protocols and b'"protocol_tests":1' not in binary:
+        raise ValueError("Protocol endpoint capability missing from firmware")
+    if protocols and b'"i2c_simulators":2' not in binary:
+        raise ValueError("Final I2C slave capability missing from firmware")
+    if protocols and b'"adc_levels":1' not in binary:
+        raise ValueError("ADC voltage test capability missing from firmware")
     vectors = validate_binary(binary, role, digest)
     prototype = json.loads((ROOT / "boards/newbeedrone/pixnova/firmware.prototype").read_text())
     validate_package(json.loads(package.read_text()), binary, prototype["board_id"])
@@ -119,12 +162,14 @@ def build(role, artifact_dir, stamp, digest, revision):
             shutil.copyfileobj(source, output)
         outputs.append({"path": str(destination), "bytes": destination.stat().st_size,
                         "sha256": hashlib.sha256(destination.read_bytes()).hexdigest()})
-    return {"role": role, "target": target, "commit": head, "dirty": dirty, **vectors, "artifacts": outputs}
+    return {"role": role, "target": target, "protocol_tests": protocols, "commit": head, "dirty": dirty, **vectors, "artifacts": outputs}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--role", choices=("both", "source", "probe"), default="both")
+    parser.add_argument("--protocols", action="store_true", default=True, help="Build the complete test/simulator pair (default)")
+    parser.add_argument("--gpio-only", dest="protocols", action="store_false", help="Build GPIO-only diagnostic images")
     parser.add_argument("--artifacts", type=Path, default=Path("/tmp/px4-firmware"))
     args = parser.parse_args()
     args.artifacts.mkdir(parents=True, exist_ok=True)
@@ -133,7 +178,7 @@ def main():
     with build_lock():
         profile, digest = load_profile(Path(__file__).with_name("profile.json"))
         revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-        results = [build(role, args.artifacts, stamp, digest, revision) for role in roles]
+        results = [build(role, args.artifacts, stamp, digest, revision, protocols=args.protocols) for role in roles]
     manifest = args.artifacts / ("pixnova-io-build_" + stamp + ".json")
     manifest.write_text(json.dumps({"profile_sha256": digest, "channels": len(profile["channels"]), "builds": results}, indent=2) + "\n")
     print(f"Build manifest: {manifest}", flush=True)

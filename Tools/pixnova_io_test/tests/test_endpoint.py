@@ -19,7 +19,7 @@ from peripherals import Peripherals
 
 @unittest.skipUnless(os.name == "posix" and shutil.which("g++"), "POSIX host g++ required for firmware endpoint tests")
 class EndpointTests(unittest.TestCase):
-    def compile_and_run(self, receiver):
+    def compile_and_run(self, receiver, protocols=False):
         profile, digest = load_profile(HERE.parent / "profile.json")
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
@@ -38,8 +38,14 @@ class EndpointTests(unittest.TestCase):
                        str(HERE / "endpoint_test.cpp"), "-o", str(executable)]
             if receiver:
                 command.insert(1, "-DCONFIG_GPIO_TEST_RECEIVER=1")
+            if protocols:
+                command.insert(1, "-DCONFIG_GPIO_TEST_PROTOCOLS=1")
             result = subprocess.run(command, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            if protocols:
+                result = subprocess.run([str(executable), "protocol"], capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                return
             result = subprocess.run([str(executable)], capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             hello = subprocess.run([str(executable), "hello"], capture_output=True, text=True, timeout=10)
@@ -60,7 +66,7 @@ class EndpointTests(unittest.TestCase):
                 assessment = Assessment(profile)
                 assessment.reset("a" * 32)
                 frames = [json.loads(line) for line in result.stdout.splitlines()]
-                self.assertEqual(len(frames), len(profile["channels"]) * 3)
+                self.assertEqual(len(frames), sum(row.get("method") != "adc_voltage" for row in profile["channels"]) * 3)
                 for frame in frames:
                     self.assertTrue(assessment.accept(frame, now=frame["seq"]))
                 self.assertTrue(assessment.all_passed)
@@ -70,3 +76,9 @@ class EndpointTests(unittest.TestCase):
 
     def test_probe_endpoint(self):
         self.compile_and_run(True)
+
+    def test_protocol_source_command_gates(self):
+        self.compile_and_run(False, protocols=True)
+
+    def test_protocol_probe_command_gates(self):
+        self.compile_and_run(True, protocols=True)

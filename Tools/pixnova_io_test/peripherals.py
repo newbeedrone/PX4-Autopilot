@@ -26,6 +26,20 @@ EXPECTED = {"source": {key: value["id"] for key, value in DEVICES.items()},
             "probe": {"probe_input_only_firmware": 1}}
 
 
+def interface_result(frame, channels=43):
+    """Validate interface evidence independently of onboard device results."""
+    name, detail = frame.get("test"), frame.get("detail")
+    if frame.get("pass") is not True or type(detail) is not int:
+        return False
+    if name == "hrt_clock":
+        return 4000 <= detail < 100000
+    if name == "gpio_inputs":
+        return detail == channels
+    if name == "i2c1_no_attached_devices":
+        return detail in (-1, 0)
+    return name in ("probe_input_only_firmware", "probe_protocol_firmware") and detail == 1
+
+
 def display_value(spec, value):
     if value is None:
         return "—"
@@ -41,25 +55,27 @@ class Peripherals:
         self.reset()
 
     def reset(self):
+        self.probe_check = "probe_input_only_firmware"
         self.power = {role: {} for role in EXPECTED}
         self.summaries = {}
         self.latest = {key: {"status": "WAITING", "detail": None, "stage": "POWER-ON"} for key in DEVICES}
         self.current_seen = set()
 
     @staticmethod
-    def result(role, frame):
+    def result(role, frame, probe_check="probe_input_only_firmware"):
+        expected = {probe_check: 1} if role == "probe" else EXPECTED[role]
         name, passed, detail = frame.get("test"), frame.get("pass"), frame.get("detail")
-        if not isinstance(name, str) or name not in EXPECTED[role] or type(passed) is not bool or type(detail) is not int or not -0x80000000 <= detail <= 0x7fffffff:
+        if not isinstance(name, str) or name not in expected or type(passed) is not bool or type(detail) is not int or not -0x80000000 <= detail <= 0x7fffffff:
             raise ValueError("Invalid onboard peripheral result")
         spec = DEVICES.get(name, {})
-        matches = detail >= EXPECTED[role][name] if spec.get("minimum") else detail == EXPECTED[role][name]
+        matches = detail >= expected[name] if spec.get("minimum") else detail == expected[name]
         good = passed and matches
         return name, {"status": "PASS" if good else "FAIL", "detail": detail, "pass": good}
 
     def power_result(self, role, frame):
         if role in self.summaries:
             raise ValueError("Unexpected power-on results after completion")
-        name, result = self.result(role, frame)
+        name, result = self.result(role, frame, self.probe_check)
         if name in self.power[role]:
             raise ValueError("Duplicate power-on peripheral result")
         self.power[role][name] = result
@@ -67,7 +83,8 @@ class Peripherals:
             self.latest[name] = {**result, "stage": "POWER-ON"}
 
     def finish_power(self, role, frame):
-        if role in self.summaries or type(frame.get("pass")) is not bool or type(frame.get("count")) is not int or frame["count"] != len(EXPECTED[role]) or set(self.power[role]) != set(EXPECTED[role]):
+        expected = {self.probe_check: 1} if role == "probe" else EXPECTED[role]
+        if role in self.summaries or type(frame.get("pass")) is not bool or type(frame.get("count")) is not int or frame["count"] != len(expected) or set(self.power[role]) != set(expected):
             raise ValueError("Incomplete power-on peripheral results")
         checked, uptime = frame.get("checked_us"), frame.get("uptime_us")
         if type(checked) is not int or type(uptime) is not int or not 0 <= checked <= uptime <= 0x7fffffffffffffff:
@@ -85,13 +102,20 @@ class Peripherals:
     def passed(self, roles=("source", "probe")):
         return all(self.summaries.get(role, {}).get("pass") is True for role in roles)
 
+    def complete(self, roles=("source", "probe")):
+        return all(role in self.summaries and "error" not in self.summaries[role] for role in roles)
+
+    def interfaces_ready(self, roles=("source", "probe")):
+        return self.complete(roles) and ("probe" not in roles or self.passed(("probe",)))
+
     def begin_current(self):
         self.current_seen.clear()
-        self.latest = {key: {"status": "VERIFYING", "detail": None, "stage": "PRE-TEST"} for key in DEVICES}
+        self.latest = {key: result if result.get("status") == "FAIL" else {"status": "VERIFYING", "detail": None, "stage": "PRE-TEST"}
+                       for key, result in self.latest.items()}
 
     def end_current(self):
         for name, result in self.latest.items():
-            if name not in self.current_seen:
+            if name not in self.current_seen and result["status"] != "FAIL":
                 result["status"] = "WAITING"
 
     def current_result(self, frame):

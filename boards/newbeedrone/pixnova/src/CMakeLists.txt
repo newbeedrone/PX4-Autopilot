@@ -67,6 +67,12 @@ else()
 		target_sources(drivers_board PRIVATE gpio_test_board.cpp)
 		target_include_directories(drivers_board PRIVATE ${PX4_SOURCE_DIR}/src/systemcmds/gpio_test)
 	endif()
+	if(CONFIG_GPIO_TEST_PROTOCOLS)
+		target_sources(drivers_board PRIVATE protocol_test_board.cpp)
+		if(NOT CONFIG_GPIO_TEST_RECEIVER)
+			target_link_libraries(drivers_board PRIVATE arch_adc)
+		endif()
+	endif()
 
 	target_link_libraries(drivers_board
 		PRIVATE

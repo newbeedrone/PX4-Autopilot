@@ -11,6 +11,8 @@ int main()
 	unsigned windows = 0;
 
 	for (const auto &channel : GPIO_TEST_CHANNELS) {
+		if (!channel.waveform) { continue; }
+
 		for (const int clock_ppm : {-100, 100}) {
 			for (const unsigned phase_us : {7u, 31u, 49u}) {
 				GpioTestEdges edges;

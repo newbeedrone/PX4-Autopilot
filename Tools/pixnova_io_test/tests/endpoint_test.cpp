@@ -9,6 +9,21 @@
 #undef usleep
 #undef private
 
+#ifdef CONFIG_GPIO_TEST_PROTOCOLS
+// Substitute only hardware ownership; exercise the actual USB command gates.
+int ProtocolTest::start(protocol_test::Mode mode, uint32_t)
+{
+	if (mode == protocol_test::Mode::None) { return -EINVAL; }
+
+	_mode = mode;
+	_feed = test_now;
+	return 0;
+}
+void ProtocolTest::stop() { _mode = protocol_test::Mode::None; }
+bool ProtocolTest::feed() { return test_now - _feed <= GPIO_TEST_LEASE_US; }
+bool ProtocolTest::update(ProtocolSample &) { return false; }
+#endif
+
 static const char *SESSION = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 struct Fixture {
@@ -21,6 +36,7 @@ struct Fixture {
 		endpoint._fd = sockets[0];
 		test_now = 1000;
 		test_board_ok = true;
+		test_external_ok = true;
 		test_bad_pin = -1;
 		test_read_cost_us = 0;
 		test_modes.fill(0);
@@ -59,6 +75,16 @@ struct Fixture {
 		return output;
 	}
 
+#ifdef CONFIG_GPIO_TEST_PROTOCOLS
+	std::string protocol_check(const char *mode = "I2C3")
+	{
+		char line[160] {};
+		snprintf(line, sizeof(line), "PCHECK %s %s %s", SESSION, GPIO_TEST_PROFILE_SHA, mode);
+		endpoint.command(line);
+		return drain();
+	}
+#endif
+
 	void inputs_only() const
 	{
 		for (const uint32_t config : test_modes) {
@@ -69,6 +95,91 @@ struct Fixture {
 
 int main(int argc, char *argv[])
 {
+#ifdef CONFIG_GPIO_TEST_PROTOCOLS
+
+	if (argc > 1 && strcmp(argv[1], "protocol") == 0) {
+		for (bool checked : {false, true}) {
+			Fixture f;
+
+			if (checked) { f.protocol_check(); }
+
+			char command[160] {};
+			snprintf(command, sizeof(command), "PROTO %s %s I2C3 12345678", SESSION, GPIO_TEST_PROFILE_SHA);
+			f.endpoint.command(command);
+			assert(f.endpoint._protocol.active() == checked);
+			f.inputs_only();
+
+			if (checked) {
+				assert(f.command("START").find("self_check_required") != std::string::npos);
+				assert(!f.endpoint._protocol.active());
+			}
+		}
+
+		for (const char *tail : {"I2C3 1", "I2C3 1234567z", "I2C3 12345678 extra", "UNKNOWN 12345678"}) {
+			Fixture f;
+			f.protocol_check();
+			char command[160] {};
+			snprintf(command, sizeof(command), "PROTO %s %s %s", SESSION, GPIO_TEST_PROFILE_SHA, tail);
+			f.endpoint.command(command);
+			assert(!f.endpoint._protocol.active());
+			f.inputs_only();
+		}
+
+		for (const char *stop : {"STOP", "HELLO", "BAD"}) {
+			Fixture f;
+			f.protocol_check();
+			char command[160] {};
+			snprintf(command, sizeof(command), "PROTO %s %s I2C3 12345678", SESSION, GPIO_TEST_PROFILE_SHA);
+			f.endpoint.command(command);
+			assert(f.endpoint._protocol.active());
+			f.command(stop, false);
+			assert(!f.endpoint._protocol.active());
+		}
+		{
+			Fixture f;
+			f.protocol_check();
+			f.endpoint._power_ok = false;
+			char command[160] {};
+			snprintf(command, sizeof(command), "PROTO %s %s I2C3 12345678", SESSION, GPIO_TEST_PROFILE_SHA);
+			f.endpoint.command(command);
+			assert(f.endpoint._protocol.active() == !RECEIVER);
+		}
+
+		for (const char *checked_mode : {"GPIO", "CAN", "I2C3"}) {
+			Fixture f;
+
+			if (strcmp(checked_mode, "GPIO") == 0) { f.command("CHECK"); }
+
+			else { f.protocol_check(checked_mode); }
+
+			char command[160] {};
+			snprintf(command, sizeof(command), "PROTO %s %s CAN 12345678", SESSION, GPIO_TEST_PROFILE_SHA);
+			f.endpoint.command(command);
+			assert(f.endpoint._protocol.active() == (strcmp(checked_mode, "CAN") == 0));
+			f.inputs_only();
+		}
+
+		{
+			Fixture f;
+			f.protocol_check();
+			assert(f.command("START").find("self_check_required") != std::string::npos);
+			f.inputs_only();
+		}
+
+		{
+			Fixture f;
+			test_board_ok = false;
+			f.protocol_check();
+			char command[160] {};
+			snprintf(command, sizeof(command), "PROTO %s %s I2C3 12345678", SESSION, GPIO_TEST_PROFILE_SHA);
+			f.endpoint.command(command);
+			assert(f.endpoint._protocol.active() == !RECEIVER);
+		}
+		return 0;
+	}
+
+#endif
+
 	if (argc > 1 && strcmp(argv[1], "hello") == 0) {
 		Fixture f;
 		const std::string output = f.command("HELLO", false);
@@ -89,6 +200,8 @@ int main(int argc, char *argv[])
 			}
 
 			for (unsigned i = 0; i < GPIO_TEST_COUNT; i++) {
+				if (!GPIO_TEST_CHANNELS[i].waveform) { continue; }
+
 				test_levels[test_pin(i, false) & 255] = (elapsed / GPIO_TEST_CHANNELS[i].half_period_us) & 1;
 			}
 
@@ -122,7 +235,9 @@ int main(int argc, char *argv[])
 		assert(!f.endpoint._power_ok);
 		test_board_ok = true;
 		f.command("CHECK");
-		assert(f.command("START").find("self_check_required") != std::string::npos);
+		const std::string result = f.command("START");
+		assert((result.find("self_check_required") != std::string::npos) == RECEIVER);
+		f.command("STOP", false);
 		f.inputs_only();
 	}
 
@@ -136,7 +251,12 @@ int main(int argc, char *argv[])
 		assert(!f.endpoint._checked);
 
 		for (unsigned i = 0; i < GPIO_TEST_COUNT; i++) {
-			assert(static_cast<bool>(test_modes[test_pin(i, false) & 255] & GPIO_OUTPUT) == !RECEIVER);
+			assert(static_cast<bool>(test_modes[test_pin(i, false) & 255] & GPIO_OUTPUT) == (!RECEIVER && GPIO_TEST_CHANNELS[i].waveform));
+
+			if (strcmp(GPIO_TEST_CHANNELS[i].name, "GPS1_BUZZER") == 0) {
+				const uint32_t pull = test_modes[test_pin(i, false) & 255] & (GPIO_PULLUP | GPIO_PULLDOWN);
+				assert(pull == (RECEIVER ? GPIO_PULLUP : GPIO_FLOAT));
+			}
 		}
 
 		assert(f.command("STOP", false).find(SESSION) != std::string::npos);
@@ -147,7 +267,17 @@ int main(int argc, char *argv[])
 	{
 		Fixture f;
 		test_board_ok = false;
-		assert(f.command("CHECK").find("\"pass\":false") != std::string::npos);
+		f.command("CHECK");
+		const std::string result = f.command("START");
+		assert((result.find("self_check_required") != std::string::npos) == RECEIVER);
+		f.command("STOP", false);
+		f.inputs_only();
+	}
+
+	if (!RECEIVER) {
+		Fixture f;
+		test_external_ok = false;
+		f.command("CHECK");
 		assert(f.command("START").find("self_check_required") != std::string::npos);
 		f.inputs_only();
 	}
@@ -198,7 +328,7 @@ int main(int argc, char *argv[])
 		Fixture f;
 		f.command("CHECK");
 		f.command("START");
-		// 47 reads taking 2 us each exceed the 50 us sampling period, even
+		// Profile reads taking 2 us each exceed the 50 us sampling period, even
 		// though the callback gap has not yet reached the late-tick threshold.
 		test_read_cost_us = 2;
 		f.endpoint.tick();

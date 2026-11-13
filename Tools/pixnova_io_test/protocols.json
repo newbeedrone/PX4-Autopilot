@@ -1,0 +1,157 @@
+{
+  "version": 2,
+  "tests": [
+    {
+      "id": "I2C3",
+      "name": "I2C3",
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "path": "PixNova PA8/PH8 \u2194 P7.3/P7.2 \u00b7 Probe PA8/PH8",
+      "wiring": "Dedicated P7: SCL to P7.3/PA8, SDA to P7.2/PH8 and common ground. The fixture alone uses 0x42; onboard EEPROM 0x51 stays in normal I2C mode. Power pins remain disconnected.",
+      "criterion": "Fresh CRC-protected requests and transformed responses, including repeated START, independently verified on both USB endpoints.",
+      "kind": "i2c",
+      "group": "I2C3"
+    },
+    {
+      "id": "GPS2_I2C",
+      "name": "GPS2 \u00b7 I2C",
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "path": "PixNova I2C2 PF1/PF0 \u2194 P3.3/P3.2 \u00b7 Probe I2C4 PF14/PF15",
+      "wiring": "SCL to P3.3, SDA to P3.2 and common ground. The flight-controller bus is I2C2; the fixture bus is I2C4. Keep the onboard ICP-20100 at 0x63. The simulator alone uses 0x42.",
+      "criterion": "Fresh requests and CRC-protected responses through the external connector, independently reported by both boards.",
+      "kind": "i2c",
+      "group": "GPS2"
+    },
+    {
+      "id": "SBUS",
+      "name": "DSM/SBUS \u00b7 SBUS",
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "path": "Probe UART8 PE1 / P3.4 \u2192 jumper \u2192 RC SBUS input \u00b7 PX4IO readback",
+      "wiring": "Disconnect the P3.4 GPS2 UART signal from PixNova before using it as a transmitter. Jumper test-board P3.4 to the flight-controller SBUS input signal, through the matching P4 signal if desired. P4.2/3 are PG13/PG12 and remain inputs. Connect common ground; leave connector power pins disconnected. No actuators attached.",
+      "criterion": "100000 baud, inverted 8E2. PX4IO must report the selected protocol, seven matching channels, advancing frame count and no failsafe or armed outputs."
+    },
+    {
+      "id": "DSM",
+      "name": "DSM/SBUS \u00b7 DSM",
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "path": "Probe UART8 PE1 / P3.4 \u2192 jumper \u2192 RC DSM input \u00b7 PX4IO readback",
+      "wiring": "Disconnect the P3.4 GPS2 UART signal from PixNova. Jumper test-board P3.4 to the flight-controller DSM input signal and connect common ground. Leave power pins disconnected. P4 cannot send hardware UART directly. No actuators attached.",
+      "criterion": "115200 baud, 8N1, DSMX 11-bit frames. PX4IO must decode the selected protocol and seven matching channels with advancing frame count."
+    },
+    {
+      "id": "CAN",
+      "name": "CAN1 \u2194 CAN2",
+      "roles": [
+        "source"
+      ],
+      "path": "PixNova CAN1 H/L \u2194 PixNova CAN2 H/L \u00b7 500 kbit/s",
+      "wiring": "Disconnect both CAN connectors from the test-board MCU headers. Connect flight-controller CAN1 H to CAN2 H, L to L and common ground. Verify correct bus termination for the isolated two-node bench bus. Do not connect CAN power pins. No internal or socket local loopback is accepted.",
+      "criterion": "At least 20 fresh, token/sequence-checked frames in each direction on distinct controllers, with no CAN error frames or receive timeouts."
+    },
+    {
+      "id": "ETH",
+      "name": "Ethernet \u2194 PC",
+      "roles": [
+        "source"
+      ],
+      "path": "PixNova ETH 192.168.77.2 \u2194 PC Ethernet 192.168.77.1 \u00b7 UDP 14570",
+      "wiring": "Disconnect ETH from fixture P2. Use the correct PixNova Ethernet adapter and a real PC Ethernet interface. Configure that isolated PC interface to 192.168.77.1/24 yourself. This application does not change PC network settings. Allow its UDP traffic through the interface firewall. USB remains connected for control.",
+      "criterion": "Physical PHY link plus fresh bidirectional, token/sequence/CRC-checked UDP request/response packets. Both the PC and flight controller must verify them."
+    },
+    {
+      "id": "GPS1_I2C",
+      "name": "GPS1 \u00b7 I2C",
+      "group": "GPS1",
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "path": "PixNova I2C1 PB8/PB9 \u2194 P19.7 PH3 / P19.6 PH4",
+      "wiring": "GPIO slave at 10 kHz; SCL to P19.7/PH3, SDA to P19.6/PH4. This follows the measured cable path. The two signals are never frequency outputs. The simulator alone uses address 0x42. Connect common ground.",
+      "criterion": "Address ACK, complete write and repeated-START read, fresh run token/sequence and CRC validation on both boards.",
+      "kind": "i2c"
+    },
+    {
+      "id": "POWER1_I2C",
+      "name": "POWER1 \u00b7 I2C",
+      "group": "POWER1",
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "path": "PixNova I2C1 PB8/PB9 \u2194 P5.3 PB8 / P5.4 PB9",
+      "wiring": "SCL to P5.3/PB8, SDA to P5.4/PB9. Signal pins and common ground only; leave both POWER1 supply pins disconnected. The simulator alone uses address 0x42. Connect common ground.",
+      "criterion": "Address ACK, complete write and repeated-START read, fresh run token/sequence and CRC validation on both boards.",
+      "kind": "i2c"
+    },
+    {
+      "id": "POWER2_I2C",
+      "name": "POWER2 \u00b7 I2C",
+      "group": "POWER2",
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "path": "PixNova I2C2 PF1/PF0 \u2194 P6.3 PF1 / P6.4 PF0",
+      "wiring": "SCL to P6.3/PF1, SDA to P6.4/PF0. Signal pins and common ground only; leave both POWER2 supply pins disconnected. Onboard ICP-20100 at 0x63 remains in normal I2C mode. The simulator alone uses address 0x42. Connect common ground.",
+      "criterion": "Address ACK, complete write and repeated-START read, fresh run token/sequence and CRC validation on both boards.",
+      "kind": "i2c"
+    },
+    {
+      "id": "UART4_I2C3",
+      "name": "UART4/I2C3 \u00b7 I2C",
+      "group": "UART4/I2C3",
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "path": "PixNova I2C3 PA8/PH8 \u2194 P17.4 PG1 / P17.3 PG2",
+      "wiring": "GPIO slave at 10 kHz: SCL to P17.4/PG1, SDA to P17.3/PG2. Onboard EEPROM 0x51 remains in normal I2C mode. The simulator alone uses address 0x42. Connect common ground.",
+      "criterion": "Address ACK, complete write and repeated-START read, fresh run token/sequence and CRC validation on both boards.",
+      "kind": "i2c"
+    },
+    {
+      "id": "ADC6V6_LOW",
+      "name": "ADC6V6 \u00b7 0 V",
+      "kind": "adc",
+      "group": "AD&IO",
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "path": "Probe PF13 / P10.7 -> PixNova ADC6V6 divider -> PC2_C / ADC1 IN12",
+      "wiring": "Connect the flight-controller ADC6V6 interface to fixture ADIO P10.7/PF13 and common ground. Both boards use USB power. The source ADC pin remains an input.",
+      "criterion": "Fixture drives 0 V with verified GPIO readback. Flight-controller ADC must measure 0\u20130.1 V for three fresh report windows.",
+      "stimulus_mv": 0,
+      "minimum_mv": 0,
+      "maximum_mv": 100
+    },
+    {
+      "id": "ADC6V6_HIGH",
+      "name": "ADC6V6 \u00b7 3.3 V",
+      "kind": "adc",
+      "group": "AD&IO",
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "path": "Probe PF13 / P10.7 -> PixNova ADC6V6 divider -> PC2_C / ADC1 IN12",
+      "wiring": "Connect the flight-controller ADC6V6 interface to fixture ADIO P10.7/PF13 and common ground. Both boards use USB power. The source ADC pin remains an input.",
+      "criterion": "Fixture drives 3.3 V with verified GPIO readback. Flight-controller ADC must measure 1.5\u20131.8 V for three fresh report windows.",
+      "stimulus_mv": 3300,
+      "minimum_mv": 1500,
+      "maximum_mv": 1800
+    }
+  ]
+}
