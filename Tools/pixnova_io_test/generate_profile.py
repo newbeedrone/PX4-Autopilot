@@ -12,7 +12,8 @@ import re
 
 # Reviewed external FMU signals only. A profile may not enable power controls,
 # internal buses or debug/USB pins by removing its own protected-pins metadata.
-ALLOWED_SOURCE_PINS = set("PA3 PA6 PA15 PB3 PB6 PB7 PC0 PC3 PC8 PC9 PC12 PD2 PD3 PD4 PD5 PD10 PD11 PD12 PD13 PD14 PE0 PE1 PE6 PE8 PE10 PE11 PF5 PF6 PF8 PF9 PF10 PG14 PH6 PH9 PH10 PH11 PH12 PH13 PH14 PI0 PI5 PI10".split())
+ALLOWED_SOURCE_PINS = set("PA3 PA6 PA15 PB3 PB6 PB7 PC0 PC8 PC9 PC12 PD2 PD3 PD4 PD5 PD10 PD11 PD12 PD13 PD14 PE0 PE1 PE6 PE8 PE10 PE11 PF5 PF6 PF8 PF9 PF10 PG14 PH6 PH9 PH10 PH11 PH12 PH13 PH14 PI0 PI5 PI10".split())
+ADC_WIRING = {("ADIO_ADC_3V3", "PC3", "PG10", "P10", 6), ("ADIO_ADC_6V6", "PC2", "PF13", "P10", 7)}
 
 
 def load_profile(path):
@@ -50,8 +51,8 @@ def load_profile(path):
         if method not in ("gpio_frequency", "adc_voltage"):
             raise ValueError("Unknown signal test method")
         analog = method == "adc_voltage"
-        if analog and (channel["id"], channel["source_pin"], channel["probe_pin"], channel["probe_connector"], channel["probe_connector_pin"]) != ("ADIO_ADC_6V6", "PC2", "PF13", "P10", 7):
-            raise ValueError("ADC voltage test requires the reviewed ADC6V6 wiring")
+        if analog and (channel["id"], channel["source_pin"], channel["probe_pin"], channel["probe_connector"], channel["probe_connector_pin"]) not in ADC_WIRING:
+            raise ValueError("ADC voltage test requires reviewed ADC3V3 or ADC6V6 wiring")
         if not analog and channel["source_pin"] not in ALLOWED_SOURCE_PINS:
             raise ValueError(f"Source pin is outside the reviewed external signals: {channel['source_pin']}")
         if not analog and channel["source_pin"] in profile.get("protected_source_pins", {}):
@@ -61,7 +62,7 @@ def load_profile(path):
         period = channel.get("half_period_us")
         if analog:
             if period is not None or "expected_hz" in channel:
-                raise ValueError("ADC6V6 is a voltage input, not a waveform output")
+                raise ValueError("ADC signals are voltage inputs, not waveform outputs")
         else:
             validate_period(channel, profile, source_periods, period_pins)
         if channel["probe_pin"] in probe_pins:

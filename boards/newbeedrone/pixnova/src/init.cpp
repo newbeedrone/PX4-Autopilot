@@ -237,6 +237,23 @@ stm32_boardinitialize(void)
  *
  ****************************************************************************/
 
+#if defined(CONFIG_GPIO_TEST_RECEIVER) && defined(CONFIG_ARCH_HIPRI_INTERRUPT)
+static int probe_pendsv(int, void *, void *)
+{
+	// arm_doirq performs deferred scheduling and signal delivery after this
+	// dispatch. The probe fast IRQ has no additional OS work to deliver.
+	return OK;
+}
+
+extern "C" __EXPORT void board_early_initialize()
+{
+	// The generic STM32 debug handler treats PendSV as a fault. With HIPRI
+	// enabled, this NuttX version also dispatches normal deferred task/signal
+	// work through PendSV. Install its valid handler before tasks start.
+	DEBUGVERIFY(irq_attach(STM32_IRQ_PENDSV, probe_pendsv, nullptr));
+}
+#endif
+
 __EXPORT int board_app_initialize(uintptr_t arg)
 {
 #if !defined(BOOTLOADER)

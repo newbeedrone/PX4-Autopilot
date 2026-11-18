@@ -25,7 +25,7 @@ class EndpointTests(unittest.TestCase):
             folder = Path(temporary)
             headers = ["px4_platform_common/px4_config.h", "px4_platform_common/log.h",
                        "px4_platform_common/tasks.h", "px4_platform_common/atomic.h",
-                       "px4_platform_common/board_common.h", "px4_platform/gpio.h",
+                       "px4_platform_common/board_common.h", "px4_platform_common/shutdown.h", "px4_platform/gpio.h",
                        "drivers/drv_hrt.h", "lib/version/version.h", "board_config.h", "nuttx/irq.h"]
             for name in headers:
                 path = folder / name
@@ -33,7 +33,7 @@ class EndpointTests(unittest.TestCase):
                 path.write_text('#include "endpoint_test_platform.hpp"\n')
             (folder / "gpio_test_profile.h").write_text(generate_header(profile, digest))
             executable = folder / "endpoint-test"
-            command = ["g++", "-std=c++14", "-Wall", "-Wextra", "-Werror", "-I" + str(folder),
+            command = ["g++", "-std=c++14", "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined", "-I" + str(folder),
                        "-I" + str(HERE), "-I" + str(ROOT / "src/systemcmds/gpio_test"),
                        str(HERE / "endpoint_test.cpp"), "-o", str(executable)]
             if receiver:

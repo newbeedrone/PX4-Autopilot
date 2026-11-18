@@ -90,9 +90,11 @@ class Assessment:
     def _fail(result, reason):
         result.status, result.reason, result.streak = "FAIL", reason, 0
 
-    def expire(self, now=None, timeout=2.5):
+    def expire(self, now=None, timeout=2.5, indices=None):
         now = time.monotonic() if now is None else now
-        for row, result in zip(self.profile["channels"], self.results):
+        for index, (row, result) in enumerate(zip(self.profile["channels"], self.results)):
+            if indices is not None and index not in indices:
+                continue
             if row.get("method") == "adc_voltage":
                 continue
             last_seen = result.received_at if result.sequence else self.started_at

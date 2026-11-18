@@ -2,7 +2,6 @@
 """Dual-USB PixNova GPIO continuity and frequency test station."""
 
 import argparse
-import csv
 from copy import deepcopy
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -23,9 +22,16 @@ from model import Assessment
 from peripherals import Peripherals, EXPECTED, DEVICES, display_value, interface_result
 from transport import SerialEndpoint
 from protocol_model import ProtocolRun, TESTS
+from ethernet import EthernetPeer
+from workflow import GpioSequence, GpioStop
+from completion import CompletionWorker, PreparationWorker, save_csv
 
 I2C_MODES = tuple(name for name, spec in TESTS.items() if spec.get("kind") == "i2c")
-ADC_MODES = ("ADC6V6_LOW", "ADC6V6_HIGH")
+ADC_MODES = tuple(name for name, spec in TESTS.items() if spec.get("kind") == "adc")
+IO_MODES = tuple(name for name, spec in TESTS.items() if spec.get("kind") == "io_pwm")
+PREPARATION_TIMEOUT = 30  # Slow/unavailable report shares must not trap the station.
+ADC_CHANNEL_MODES = {TESTS[mode]["channel"]: tuple(name for name in ADC_MODES if TESTS[name]["channel"] == TESTS[mode]["channel"])
+                     for mode in ADC_MODES}
 
 
 class Station:
@@ -37,8 +43,15 @@ class Station:
         self.current_roles = set()
         self.capabilities, self.i2c_results = {}, {}
         self.i2c_run, self.i2c_queue = None, []
+        self.connector_modes, self.connector_cancelled = (), False
         self.suite_active, self.suite_completed, self.gpio_snapshot = False, False, None
+        self.completed_report = None
         self.suite_gpio_started = None
+        self.suite_stage, self.extended_suite, self.ethernet = None, False, None
+        self.gpio_sequence, self.gpio_stop, self.finish_worker = None, None, None
+        self.gpio_followup, self.gpio_stop_reason = None, ""
+        self.finish_plan = None
+        self.prepare_worker = None
         self.events = queue.Queue(maxsize=4096)
         self.links, self.hello, self.checked = {}, {}, {}
         self.identities = {}
@@ -54,9 +67,9 @@ class Station:
         self.demo_peripheral_fault = tk.BooleanVar(value=False)
         self._build()
         root.protocol("WM_DELETE_WINDOW", self.close)
-        root.after(50, self.pump)
+        self.pump_after_id = root.after(50, self.pump)
         if demo:
-            root.after(150, self.start_demo)
+            root.after(150, lambda: self.start_demo() if not self.closing and not self.hello else None)
 
     def _build(self):
         self.view = Dashboard(self)
@@ -66,11 +79,23 @@ class Station:
 
     def open_protocols(self):
         """Transfer USB ownership after stopping the frequency station."""
+        if self.operation_locked(): return
+        if self.network_busy():
+            self.note("Wait for the Ethernet adapter operation before switching windows."); return
         if getattr(self, "protocol_window", None) and not self.protocol_window.closed:
             self.protocol_window.root.lift()
             return
+        if self.phase == "I2C_RUNNING":
+            self.stop("Switching to connector protocol tests")
+            self.root.after(100, self.open_protocols)
+            return
+        if self.i2c_run and self.i2c_run.phase == "FAILED" and not self.i2c_run.outputs_stopped:
+            self.note("STOP was not confirmed; reconnect USB before switching tests.")
+            return
+        if self.defer_gpio_stop(self.open_protocols, "Switching to connector protocol tests"): return
         self.stop("Switching to connector protocol tests")
         self.generation += 1
+        self.view.network_panel.cancel_test()
         for link in self.links.values():
             link.close()
         for link in self.links.values():
@@ -112,10 +137,29 @@ class Station:
             self.note("Install pyserial for hardware connections; the demo works without it.")
 
     def transmit(self, role, command):
+        if self.demo and self.phase == "STOPPING_GPIO" and command.startswith("STOP "):
+            self.events.put((role, {"type": "stopped", "session": command.split()[1], "reason": "requested"}))
+            return
         if not self.demo and role in self.links:
             self.links[role].send(command)
+        elif self.demo and self.phase == "I2C_RUNNING" and self.i2c_run:
+            run = self.i2c_run
+            def emit(frame): self.events.put((role, {"session": run.session, **frame}))
+            if command.startswith("PCHECK "):
+                checks = {key: spec.get("demo", spec["id"]) for key, spec in DEVICES.items()} if role == "source" else {"probe_protocol_firmware": 1}
+                checks.update(hrt_clock=5000, gpio_inputs=len(self.profile["channels"]))
+                for key, value in checks.items(): emit({"type": "check", "test": key, "pass": True, "detail": value})
+                emit({"type": "checked", "mode": run.mode, "pass": True})
+            elif command.startswith("PROTO "):
+                emit({"type": "started", "mode": run.mode, "role": role})
+            elif command.startswith("PING "):
+                emit({"type": "heartbeat", "running": True})
+            elif command == "STOP" or command.startswith("STOP "):
+                emit({"type": "stopped", "reason": "requested"})
 
     def connect(self):
+        if self.phase in ("PREPARING", "FINISHING", "STOPPING_GPIO"):
+            self.note("Wait for preparation, output shutdown or firmware restoration before reconnecting."); return
         if getattr(self, "protocol_window", None) and not self.protocol_window.closed:
             self.note("Close the protocol window before reconnecting the frequency station.")
             return
@@ -145,8 +189,15 @@ class Station:
         self.current_roles.clear()
         self.capabilities.clear(); self.i2c_results.clear()
         self.i2c_run, self.i2c_queue = None, []
+        self.connector_modes, self.connector_cancelled = (), False
         self.suite_active = self.suite_completed = False
+        self.completed_report = None
         self.gpio_snapshot = None
+        self.suite_stage, self.extended_suite = None, False
+        self.gpio_sequence = self.gpio_stop = None
+        self.gpio_followup = None
+        self.finish_plan = None
+        self.close_ethernet()
         self.auto_start = False
         self.check_details.clear()
         self.phase, self.phase_started = "CONNECTING", time.monotonic()
@@ -157,36 +208,295 @@ class Station:
             self.links[role].start()
 
     def start_full_test(self):
-        if self.phase in ("CONNECTING", "CHECKING", "STARTING_PROBE", "STARTING_SOURCE", "I2C_RUNNING"):
+        if self.operation_locked(): return
+        if self.network_busy():
+            self.note("Wait for the Ethernet adapter operation before testing."); return
+        if self.phase in ("CONNECTING", "CHECKING", "STARTING_PROBE", "STARTING_SOURCE", "I2C_RUNNING", "RUNNING"):
             self.note("Wait for the active test or stop it before restarting."); return
-        if not self.demo and not all(getattr(self, "capabilities", {}).get(role, {}).get("i2c_simulators") == 2
-                                     and self.capabilities[role].get("adc_levels") == 1 for role in ("source", "probe")):
-            self.note("Connect both boards with the I2C simulator and ADC voltage firmware before starting the complete test.")
+        if self.i2c_run and self.i2c_run.phase == "FAILED" and not self.i2c_run.outputs_stopped:
+            self.note("STOP was not confirmed; reconnect both USB endpoints before testing."); return
+        if not self.demo and not {"source", "probe"}.issubset(self.hello):
+            missing = ", ".join("PixNova" if role == "source" else "measurement board" for role in ("source", "probe") if role not in self.hello)
+            message = "Cannot start test: " + missing + " USB offline · reconnect USB and select Connect USB"
+            self.state.set(message); self.state_label.configure(foreground=RED); self.note(message)
             return
+        if not self.demo and (not {"source", "probe"}.issubset(self.hello) or not self.peripherals.interfaces_ready()
+                              or not all(getattr(self, "capabilities", {}).get(role, {}).get("i2c_simulators") == 2
+                                         and self.capabilities[role].get("adc_levels") == 2
+                                         and self.capabilities[role].get("io_pwm") == 1
+                                         and self.capabilities[role].get("sbus_out") == 1
+                                         and self.capabilities[role].get("session_stop") == 1 for role in ("source", "probe"))):
+            self.note("Update and connect both boards with the I2C, ADC, IOV2 PWM and SBUS OUT test firmware before starting the complete test.")
+            return
+        completion = getattr(getattr(self, "view", None), "completion", None)
+        if completion is not None:
+            try:
+                selection = completion.selection(self.demo)
+            except Exception as error:
+                self.state.set("Cannot start complete test: " + str(error))
+                completion.status.set(str(error)); return
+            if not self.demo and self.capabilities.get("source", {}).get("usb_restore") != 1:
+                self.state.set("Update the flight-controller test firmware for automatic USB restoration"); return
+            self.prepare_origin = self.phase, self.generation, dict(self.identities)
+            self.prepare_worker = PreparationWorker(*selection)
+            self.prepare_started = time.monotonic()
+            self.phase = "PREPARING"
+            message = "Preparing test · validating normal firmware and CSV folder · Stop cancels"
+            self.state.set(message); completion.status.set(message)
+            self.prepare_worker.start()
+            return
+        self.begin_full_test(None)
+
+    def begin_full_test(self, finish_plan):
         self.i2c_results = {}; self.gpio_snapshot = None; self.suite_completed = False
         self.start()
-        self.suite_active = not self.demo and self.phase == "CHECKING" and self.auto_start
+        self.suite_active = self.phase == "CHECKING" and self.auto_start
+        self.suite_stage, self.extended_suite = ("fmu", True) if self.suite_active else (None, False)
         self.suite_gpio_started = None
+        self.finish_plan = finish_plan
+        self.gpio_sequence = GpioSequence(self.profile) if self.suite_active else None
+        self.gpio_stop = None
+
+    def poll_preparation(self):
+        worker = getattr(self, "prepare_worker", None)
+        if worker is None: return
+        try: event = worker.events.get_nowait()
+        except queue.Empty:
+            if time.monotonic() - self.prepare_started < PREPARATION_TIMEOUT: return
+            event = {"error": "Firmware/CSV preparation timed out; check file and folder availability"}
+        self.prepare_worker = None
+        phase, generation, identities = self.prepare_origin
+        if self.phase != "PREPARING" or self.generation != generation or self.identities != identities:
+            return
+        self.phase = phase
+        completion = self.view.completion
+        if "error" in event:
+            message = "Cannot start complete test: " + event["error"]
+            self.state.set(message); completion.status.set(message)
+            self.state_label.configure(foreground=RED)
+            return
+        if not {"source", "probe"}.issubset(self.hello) or not self.peripherals.interfaces_ready():
+            message = "USB disconnected during preparation; reconnect before testing"
+            self.state.set(message); completion.status.set(message)
+            self.state_label.configure(foreground=RED)
+            return
+        completion.prepared(event["plan"], self.demo)
+        self.begin_full_test(event["plan"])
+
+    def operation_locked(self):
+        if self.phase == "PREPARING":
+            self.note("Validating firmware and CSV folder in the background; Stop cancels."); return True
+        if self.phase == "FINISHING":
+            self.note("Saving results or restoring firmware; wait for completion."); return True
+        pending = getattr(self, "gpio_stop", None)
+        if pending and (not pending.done or pending.error):
+            self.note("GPIO STOP is pending or failed; confirm shutdown or reconnect USB."); return True
+        return False
+
+    def start_can(self):
+        self._start_connector_modes(["CAN"])
+
+    def start_gpio_groups(self, groups):
+        sequence = GpioSequence(self.profile, groups)
+        if self.operation_locked(): return
+        if self.phase in ("CONNECTING", "CHECKING", "STARTING_PROBE", "STARTING_SOURCE", "I2C_RUNNING"):
+            self.note("Wait for the active operation or stop it before selecting GPIO connectors."); return
+        selected_groups = tuple(sequence.groups)
+        if self.defer_gpio_stop(lambda: self.start_gpio_groups(selected_groups), "Selecting GPIO connectors"): return
+        self.start()
+        if self.phase != "CHECKING" or not self.auto_start: return
+        self.finish_plan = None
+        self.gpio_sequence = sequence
+        self.suite_active, self.extended_suite, self.suite_stage = True, False, "gpio_only"
+        selected = set(i for indices in sequence.indices.values() for i in indices)
+        for index, result in enumerate(self.assessment.results):
+            if index not in selected:
+                result.status, result.reason = "NOT RUN", "Outside selected GPIO connector scope"
+
+    def gpio_indices(self):
+        sequence = getattr(self, "gpio_sequence", None)
+        return sequence.active_indices if sequence is not None and self.suite_active else None
+
+    def advance_gpio_sequence(self, now):
+        sequence = self.gpio_sequence
+        if sequence.tick(self.assessment, now):
+            self.gpio_snapshot = self.report_snapshot(now)
+            self.phase = "STOPPING_GPIO"
+            self.gpio_stop = GpioStop(self.assessment.session, now, self.transmit)
+            self.state.set(("Selected GPIO measurements finished" if self.suite_stage == "gpio_only" else "FMU/PPM measurements finished") + " · confirming both GPIO outputs stopped")
+            return
+        self.state.set(f"Automatic test · GPIO {sequence.position + 1}/{len(sequence.groups)} · {sequence.group}")
+        if hasattr(self, "view") and self.view.filter_group != sequence.group:
+            self.view.filter(sequence.group)
+
+    def defer_gpio_stop(self, action, reason):
+        if self.phase not in ("RUNNING", "STARTING_PROBE", "STARTING_SOURCE"): return False
+        self.stop(reason)
+        self.gpio_followup = action
+        return True
+
+    def poll_gpio_stop(self, now):
+        if self.phase != "STOPPING_GPIO": return
+        self.gpio_stop.tick(now)
+        if not self.gpio_stop.done: return
+        self.phase = "STOPPED"
+        followup, self.gpio_followup = getattr(self, "gpio_followup", None), None
+        if self.gpio_stop.error:
+            self.suite_active = self.auto_start = False
+            self.state.set(self.gpio_stop.error)
+            self.state_label.configure(foreground=RED)
+        elif followup is not None:
+            self.suite_active = self.auto_start = False
+            self.state.set("GPIO outputs stopped (confirmed)")
+            generation, stopped = self.generation, self.gpio_stop
+            def resume():
+                if not self.closing and self.generation == generation and self.phase == "STOPPED" and self.gpio_stop is stopped:
+                    followup()
+            self.root.after(0, resume)
+        elif self.suite_active:
+            if self.suite_stage == "gpio_only":
+                self.suite_active = self.auto_start = False
+                self.phase = "GPIO_COMPLETE"
+                rows = [row for results in self.gpio_sequence.completed.values() for row in results]
+                passed = sum(row["status"] == "PASS" for row in rows)
+                self.state.set(f"SELECTED GPIO TESTS COMPLETE · {passed}/{len(rows)} PASS · outputs stopped (confirmed)")
+                self.state_label.configure(foreground=GREEN if passed == len(rows) else RED)
+            else:
+                self._start_connector_modes(list(I2C_MODES + ADC_MODES) + ["CAN"])
+                self.suite_stage = "fmu"
+        else:
+            self.state.set((getattr(self, "gpio_stop_reason", "") or "Cancelled") + " · GPIO outputs stopped (confirmed)")
+
+    def finish_suite(self):
+        if getattr(self, "finish_plan", None) is None: return
+        image, directory = self.finish_plan
+        self.finish_plan = None
+        source = getattr(self.links.get("source"), "device", self.source_port.get())
+        probe = getattr(self.links.get("probe"), "device", self.probe_port.get())
+        self.finish_worker = CompletionWorker(self.completed_report, directory, image, source, probe, self.demo)
+        self.phase = "FINISHING"
+        self.generation += 1
+        for link in self.links.values(): link.close()
+        for link in self.links.values(): link.join(timeout=.5)
+        self.links.clear()
+        self.hello.clear()
+        self.finish_worker.start()
+
+    def poll_completion(self):
+        worker = getattr(self, "finish_worker", None)
+        if worker is None: return
+        while True:
+            try: event = worker.events.get_nowait()
+            except queue.Empty: break
+            if "progress" in event:
+                self.state.set(event["progress"])
+                self.view.completion.status.set(event["progress"])
+            if event.get("done"):
+                self.completed_report = event["report"]
+                self.phase = "COMPLETE"
+                message = ("Finish failed: " + event["error"] if "error" in event else
+                           "CSV saved · " + ("DEMO; no hardware flashed" if self.demo else "normal firmware restored; CRC and reboot confirmed"))
+                self.show_completion()
+                self.state.set(self.state.get() + " · " + message)
+                self.view.completion.status.set(message + " · " + event["csv"])
+                if "error" in event: self.state_label.configure(foreground=RED)
+                self.finish_worker = None
 
     def start_i2c(self, mode=None):
         if mode is not None and mode not in I2C_MODES:
             raise ValueError("Invalid I2C connector")
         self._start_connector_modes([mode] if mode else list(I2C_MODES))
 
-    def start_adc(self):
-        self._start_connector_modes(list(ADC_MODES))
+    def start_adc(self, channel_id=None):
+        if channel_id is not None and channel_id not in ADC_CHANNEL_MODES:
+            raise ValueError("Invalid ADC input")
+        self._start_connector_modes(list(ADC_CHANNEL_MODES[channel_id] if channel_id else ADC_MODES))
+
+    def start_iov2(self, mode=None):
+        if mode is not None and mode not in IO_MODES:
+            raise ValueError("Invalid IOV2 PWM output")
+        resume = mode is None and self.phase == "WAITING_IOV2" and self.suite_active
+        self._start_connector_modes([mode] if mode else list(IO_MODES) + (["SBUS_OUT"] if resume else []))
+        if resume and self.phase == "I2C_RUNNING": self.suite_stage = "iov2"
+
+    def start_sbus_out(self):
+        self._start_connector_modes(["SBUS_OUT"])
+
+    def network_idle(self):
+        child = getattr(self, "protocol_window", None)
+        return self.phase not in ("PREPARING", "RUNNING", "CONNECTING", "CHECKING", "STARTING_PROBE", "STARTING_SOURCE", "I2C_RUNNING", "STOPPING_GPIO", "FINISHING") and not (child and not child.closed)
+
+    def network_busy(self):
+        panel = getattr(getattr(self, "view", None), "network_panel", None)
+        return panel is not None and panel.changing
+
+    def start_ethernet(self, interface_index=None):
+        if self.operation_locked(): return
+        if self.network_busy():
+            self.note("Wait for the Ethernet adapter operation before testing."); return
+        if self.phase in ("CONNECTING", "CHECKING", "STARTING_PROBE", "STARTING_SOURCE", "I2C_RUNNING"):
+            self.note("Wait for the active operation before Ethernet testing."); return
+        resume = self.phase == "WAITING_ETH" and self.suite_active
+        if self.demo:
+            self._start_connector_modes(["ETH"])
+            if resume and self.phase == "I2C_RUNNING": self.suite_stage = "ethernet"
+            return
+        if not self.network_idle():
+            self.note("Stop the active test before Ethernet testing."); return
+        if "source" not in self.hello or not self.peripherals.interfaces_ready(("source",)):
+            self.note("Connect and verify the flight controller USB endpoint before Ethernet testing."); return
+        panel = getattr(getattr(self, "view", None), "network_panel", None)
+        if panel is not None and interface_index is None:
+            generation = self.generation
+            panel.prepare(lambda index: self.start_ethernet(index) if not self.closing and generation == self.generation else None)
+            return
+        try:
+            peer = EthernetPeer(interface_index) if interface_index is not None else EthernetPeer()
+        except ValueError as error:
+            self.state.set(str(error)); self.note(str(error)); return
+        self.close_ethernet()
+        self.ethernet = peer
+        self._start_connector_modes(["ETH"])
+        if self.phase != "I2C_RUNNING": self.close_ethernet()
+        elif resume: self.suite_stage = "ethernet"
+
+    def close_ethernet(self):
+        if getattr(self, "ethernet", None) is not None:
+            self.ethernet.close()
+            self.ethernet = None
 
     def _start_connector_modes(self, modes):
+        if self.operation_locked(): return
+        if self.network_busy():
+            self.note("Wait for the Ethernet adapter operation before testing."); return
+        panel = getattr(getattr(self, "view", None), "network_panel", None)
+        if panel: panel.cancel_test()
         if self.phase in ("CONNECTING", "CHECKING", "STARTING_PROBE", "STARTING_SOURCE", "I2C_RUNNING"):
             self.note("Wait for the active check or stop it before another test."); return
-        if not all(getattr(self, "capabilities", {}).get(role, {}).get("i2c_simulators") == 2 for role in ("source", "probe")) or not self.peripherals.interfaces_ready():
-            self.note("Connector tests require both USB endpoints with the final test firmware."); return
-        if any(mode in ADC_MODES for mode in modes) and not all(self.capabilities[role].get("adc_levels") == 1 for role in ("source", "probe")):
+        if self.i2c_run and self.i2c_run.phase == "FAILED" and not self.i2c_run.outputs_stopped:
+            self.note("STOP was not confirmed; reconnect both USB endpoints before testing."); return
+        roles = set().union(*(set(TESTS[mode]["roles"]) for mode in modes))
+        if not roles.issubset(self.hello) or not self.peripherals.interfaces_ready(roles):
+            self.note("Connect and verify the required USB endpoints before testing."); return
+        if any(mode in I2C_MODES + ADC_MODES for mode in modes) and not all(getattr(self, "capabilities", {}).get(role, {}).get("i2c_simulators") == 2 for role in roles):
+            self.note("Update both boards with the final I2C simulator firmware."); return
+        if any(mode in IO_MODES for mode in modes) and not all(self.capabilities.get(role, {}).get("io_pwm") == 1 and self.capabilities[role].get("session_stop") == 1 for role in roles):
+            self.note("Update both boards with the IOV2 PWM/session STOP firmware."); return
+        if "SBUS_OUT" in modes and not all(self.capabilities.get(role, {}).get("sbus_out") == 1 and self.capabilities[role].get("session_stop") == 1 for role in roles):
+            self.note("Update both boards with the SBUS OUT / PG5 test firmware."); return
+        if self.phase in ("WAITING_IOV2", "WAITING_ETH") and modes != (list(IO_MODES) + ["SBUS_OUT"] if self.phase == "WAITING_IOV2" else ["ETH"]):
+            self.note("Stop the complete workflow before selecting a different test."); return
+        if any(mode in ADC_MODES for mode in modes) and not all(self.capabilities[role].get("adc_levels") == 2 for role in ("source", "probe")):
             self.note("Update both boards to the ADC voltage test firmware."); return
         if self.phase == "RUNNING":
-            self.gpio_snapshot = self.report_snapshot()
-            self.stop("Switching from GPIO measurements to connector tests")
-        self.i2c_queue = modes
+            snapshot = self.report_snapshot()
+            if self.phase != "RUNNING": return
+            self.gpio_snapshot = snapshot
+        if self.defer_gpio_stop(lambda: self._start_connector_modes(modes), "Switching from GPIO measurements to connector tests"): return
+        self.completed_report = None
+        self.suite_completed = False
+        self.connector_modes, self.connector_cancelled = tuple(modes), False
+        self.i2c_queue = list(modes)
         for mode in modes:
             self.i2c_results.pop(mode, None)
         if any(mode in ADC_MODES for mode in modes): self._sync_adc_result()
@@ -195,10 +505,15 @@ class Station:
     def _next_i2c(self):
         mode = self.i2c_queue.pop(0)
         self.peripherals.begin_current()
-        self.i2c_run = ProtocolRun(mode, self.digest, time.monotonic(), self.transmit)
+        roles = TESTS[mode]["roles"]
+        self.i2c_run = ProtocolRun(mode, self.digest, time.monotonic(), self.transmit,
+                                   session_stop=all(self.capabilities.get(role, {}).get("session_stop") == 1 for role in roles))
         self.phase = "I2C_RUNNING"
         self.i2c_results[mode] = self.i2c_run.snapshot()
-        self.state.set(TESTS[mode]["name"] + " · checking " + ("ADC voltage" if mode in ADC_MODES else "simulated I2C slave"))
+        self.state.set(TESTS[mode]["name"] + " · fresh startup checks")
+        if hasattr(self, "view"):
+            self.view.select_connector_group("CAN" if mode == "CAN" else "Ethernet" if mode == "ETH" else
+                                             "IOV2 PWM" if mode in IO_MODES + ("SBUS_OUT",) else "I2C / ADC")
         self.i2c_run.begin()
 
     def _update_i2c(self):
@@ -207,41 +522,104 @@ class Station:
         if run.mode in ADC_MODES: self._sync_adc_result()
         self.state.set(TESTS[run.mode]["name"] + " · " + run.result.reason)
         if run.phase not in ("COMPLETE", "FAILED", "STOPPED"): return
+        if run.mode == "ETH": self.close_ethernet()
         self.peripherals.end_current()
+        if not run.outputs_stopped or self.connector_cancelled:
+            self.i2c_queue.clear()
+            self.suite_active = self.suite_completed = self.auto_start = False
+            self.phase = "STOPPED"
+            self.state_label.configure(foreground=RED if run.result.status == "FAIL" else MUTED)
+            return
         if self.i2c_queue:
             self._next_i2c()
         else:
+            if self.suite_active and getattr(self, "suite_stage", None) in ("fmu", "iov2"):
+                self.phase = "WAITING_IOV2" if self.suite_stage == "fmu" else "WAITING_ETH"
+                self.auto_start = False
+                if hasattr(self, "view"):
+                    self.view.select_connector_group("IOV2 PWM" if self.phase == "WAITING_IOV2" else "Ethernet")
+                self.state.set("FMU tests finished · outputs stopped · move P21 harness from FMU to IOV2 PWM, then click Confirm IOV2 wiring" if self.phase == "WAITING_IOV2" else
+                               f"IOV2 COMPLETE · {sum(self.i2c_results.get(mode, {}).get('status') == 'PASS' for mode in IO_MODES)}/8 PWM PASS · SBUS OUT {self.i2c_results.get('SBUS_OUT', {}).get('status', 'NOT RUN')} · outputs stopped · connect PC Ethernet and click Test Ethernet")
+                self.state_label.configure(foreground=MUTED)
+                if self.phase == "WAITING_ETH" and getattr(self, "gpio_sequence", None) is not None:
+                    self.root.after(100, lambda: self.start_ethernet() if self.phase == "WAITING_ETH" and self.suite_active else None)
+                return
             self.phase = "COMPLETE" if self.suite_active else "I2C_COMPLETE"
             self.suite_completed = self.suite_active
             self.suite_active = False
-            passed = sum(result["status"] == "PASS" for result in self.i2c_results.values())
-            self.state.set(f"Connector tests finished · {passed}/{len(self.i2c_results)} PASS · outputs stopped")
-            self.state_label.configure(foreground=GREEN if passed == len(self.i2c_results) else RED)
+            self.auto_start = False
+            if self.suite_completed:
+                self.completed_report = self.report_snapshot()
+                self.show_completion()
+                self.finish_suite()
+            else:
+                passed = sum(self.i2c_results.get(mode, {}).get("status") == "PASS" for mode in self.connector_modes)
+                heading = "IOV2 TESTS COMPLETE" if all(mode in IO_MODES for mode in self.connector_modes) else "ETHERNET TEST COMPLETE" if self.connector_modes == ("ETH",) else "SELECTED TESTS COMPLETE"
+                self.state.set(f"{heading} · {passed}/{len(self.connector_modes)} PASS · outputs stopped (confirmed)")
+                self.state_label.configure(foreground=GREEN if passed == len(self.connector_modes) else RED)
 
-    def adc_summary(self):
-        results = [self.i2c_results.get(mode, {}) for mode in ADC_MODES]
+    def show_completion(self, notice=""):
+        report = self.completed_report
+        passed = sum(row["status"] == "PASS" for row in report["channels"])
+        checks = report["peripherals"]["latest"]
+        onboard = sum(row["status"] == "PASS" for row in checks.values())
+        external = "PASS" if report["external_suite_passed"] else "FAIL"
+        connector_passed = sum(row["status"] == "PASS" for key, row in report["connector_tests"].items() if key in I2C_MODES + ADC_MODES)
+        text = (f"TEST COMPLETE · interfaces {external}: {passed}/{len(report['channels'])} signals, "
+                f"{connector_passed}/{len(I2C_MODES + ADC_MODES)} I2C/ADC checks · "
+                f"onboard {onboard}/{len(checks)} PASS · outputs stopped")
+        if report.get("extended_suite"):
+            io_passed = sum(report["connector_tests"].get(mode, {}).get("status") == "PASS" for mode in IO_MODES)
+            text += f" · IOV2 {io_passed}/8 · SBUS OUT {'PASS' if report['sbus_out_passed'] else 'FAIL'} · Ethernet {'PASS' if report['ethernet_passed'] else 'FAIL'}"
+            text += " · CAN " + ("PASS" if report.get("can_passed") else "FAIL")
+        if notice:
+            text += f" · {notice}; completed results retained"
+        self.state.set(text)
+        self.state_label.configure(foreground=GREEN if report["all_passed"] else RED)
+
+    def adc_summary(self, channel_id):
+        modes = ADC_CHANNEL_MODES[channel_id]
+        results = [self.i2c_results.get(mode, {}) for mode in modes]
         statuses = [item.get("status", "NOT RUN") for item in results]
         status = "FAIL" if "FAIL" in statuses else "PASS" if all(s == "PASS" for s in statuses) else "VERIFYING" if any(s != "NOT RUN" for s in statuses) else "NOT RUN"
         return {"status": status, "low_mv": results[0].get("adc_voltage_mv"), "high_mv": results[1].get("adc_voltage_mv"),
-                "reason": "; ".join(f"{TESTS[mode]['name']}: {item.get('reason', 'Not run')}" for mode, item in zip(ADC_MODES, results))}
+                "reason": "; ".join(f"{TESTS[mode]['name']}: {item.get('reason', 'Not run')}" for mode, item in zip(modes, results))}
 
     def _sync_adc_result(self):
-        summary = self.adc_summary()
         for row, result in zip(self.profile["channels"], self.assessment.results):
             if row.get("method") == "adc_voltage":
+                summary = self.adc_summary(row["id"])
                 result.status, result.reason = summary["status"], summary["reason"]
                 result.voltage_low_mv, result.voltage_high_mv = summary["low_mv"], summary["high_mv"]
 
     def self_check(self):
-        if self.phase == "I2C_RUNNING": self.stop("Stopping I2C slave test before self-check")
+        if self.operation_locked(): return
+        if self.network_busy():
+            self.note("Wait for the Ethernet adapter operation before testing."); return
+        panel = getattr(getattr(self, "view", None), "network_panel", None)
+        if panel: panel.cancel_test()
+        if self.phase == "I2C_RUNNING":
+            self.stop("Stopping connector test before self-check")
+            return
+        if self.i2c_run and self.i2c_run.phase == "FAILED" and not self.i2c_run.outputs_stopped:
+            self.note("STOP was not confirmed; reconnect both USB endpoints before testing."); return
         if self.phase in ("CHECKING", "CONNECTING", "STARTING_PROBE", "STARTING_SOURCE"):
             self.note("Startup is already in progress.")
             return
-        if self.phase == "RUNNING":
-            self.stop()
+        if self.defer_gpio_stop(self.self_check, "Stopping GPIO before self-check"): return
         if "source" not in self.hello or not set(self.hello).issubset(self.peripherals.summaries):
             self.note("Read the flight controller's power-on results before self-check.")
             return
+        self.completed_report = None
+        self.suite_completed = False
+        self.suite_active = False
+        self.suite_stage = None
+        self.extended_suite = False
+        self.gpio_snapshot = None
+        self.gpio_sequence = self.gpio_stop = None
+        self.i2c_results.clear()
+        self.connector_modes = ()
+        self.i2c_run = None
         self.assessment.reset(uuid.uuid4().hex)
         self.checked.clear()
         self.check_details.clear()
@@ -272,14 +650,18 @@ class Station:
             self.root.after(550, finish_demo_source)
 
     def start(self):
+        if self.operation_locked(): return
+        if self.network_busy():
+            self.note("Wait for the Ethernet adapter operation before testing."); return
+        panel = getattr(getattr(self, "view", None), "network_panel", None)
+        if panel: panel.cancel_test()
         if self.phase in ("CONNECTING", "CHECKING", "STARTING_PROBE", "STARTING_SOURCE", "I2C_RUNNING"):
             self.note("Startup is already in progress; wait for it to finish.")
             return
         if len(self.hello) != 2 or not self.peripherals.interfaces_ready():
             self.note("Complete both USB handshakes and verify the probe before GPIO output.")
             return
-        if self.phase == "RUNNING":
-            self.stop("Restarting test")
+        if self.defer_gpio_stop(self.start, "Restarting test"): return
         self.auto_start = True
         self.self_check()
 
@@ -302,10 +684,44 @@ class Station:
             self.events.put(("probe", {"type": "started", "session": self.assessment.session}))
 
     def stop(self, reason="Stopped by operator", invalid=False):
-        pretest = self.phase == "CHECKING"
+        if self.phase == "FINISHING":
+            self.note("Firmware restoration is in progress; wait for CRC verification."); return
+        if self.phase == "STOPPING_GPIO":
+            self.suite_active = self.auto_start = False
+            self.gpio_followup = None
+            if invalid and not self.gpio_stop.error:
+                self.gpio_stop.done, self.gpio_stop.error = True, reason
+                self.assessment.invalidate(reason)
+            self.note(reason + " · waiting for GPIO STOP confirmation"); return
+        self.prepare_worker = None
+        panel = getattr(getattr(self, "view", None), "network_panel", None)
+        if panel: panel.cancel_test()
+        child = getattr(self, "protocol_window", None)
+        if child is not None and not child.closed:
+            child.stop(reason)
+            self.state.set("Connector protocol tests · " + child.status.get())
+            self.note(reason)
+            return
+        pretest = self.phase in ("CONNECTING", "CHECKING")
+        if self.phase in ("RUNNING", "STARTING_PROBE", "STARTING_SOURCE"):
+            self.suite_active = self.suite_completed = self.auto_start = False
+            self.finish_plan = None
+            self.gpio_followup, self.gpio_stop_reason = None, reason
+            if invalid: self.assessment.invalidate(reason)
+            self.phase = "STOPPING_GPIO"
+            self.gpio_stop = GpioStop(self.assessment.session, time.monotonic(), self.transmit)
+            self.state.set(reason + " · waiting for both GPIO STOP confirmations")
+            self.state_label.configure(foreground=RED if invalid else MUTED)
+            self.note(reason)
+            return
         if getattr(self, "i2c_run", None) and self.i2c_run.phase not in ("COMPLETE", "FAILED", "STOPPED"):
-            self.i2c_run.stop(reason, failed=invalid)
-            self.i2c_results[self.i2c_run.mode] = self.i2c_run.snapshot()
+            self.connector_cancelled = True
+            self.i2c_queue.clear()
+            self.suite_active = self.auto_start = False
+            self.i2c_run.stop(reason, failed=invalid, now=time.monotonic())
+            self._update_i2c()
+            self.note(reason)
+            return
         self.i2c_queue = []
         self.suite_active = False
         for role in tuple(self.links):
@@ -313,6 +729,10 @@ class Station:
                 self.transmit(role, "STOP")
             except RuntimeError:
                 pass
+        if self.phase == "COMPLETE" and getattr(self, "completed_report", None):
+            self.show_completion(reason)
+            self.note(reason)
+            return
         self.phase, self.auto_start = "STOPPED", False
         if pretest:
             self.peripherals.end_current()
@@ -321,11 +741,12 @@ class Station:
             if pretest:
                 for result in self.assessment.results:
                     result.status = "NOT RUN"
-        self.state.set(("DEMO — " if self.demo else "") + reason + " · outputs stopped")
+        self.state.set(("DEMO — " if self.demo else "") + reason + " · STOP requested")
         self.state_label.configure(foreground=RED if invalid else MUTED)
         self.note(reason)
 
     def handle(self, role, frame):
+        if self.phase == "FINISHING": return
         if frame.get("_connection", self.generation) != self.generation:
             return
         now = time.monotonic()
@@ -334,6 +755,11 @@ class Station:
             self.stop(f"{role}: stale USB response; restart the test", invalid=True)
             return
         kind = frame["type"]
+        if self.phase == "STOPPING_GPIO" and kind not in ("hello", "link_error", "disconnected"):
+            self.gpio_stop.handle(role, frame, now)
+            return
+        if self.phase == "COMPLETE" and getattr(self, "completed_report", None) and kind not in ("hello", "error", "link_error", "disconnected"):
+            return
         if self.phase == "I2C_RUNNING" and kind not in ("hello", "power_check", "power_checked", "link_error", "disconnected"):
             if kind == "check" and role == "source" and frame.get("session") == self.i2c_run.session:
                 self.peripherals.current_result(frame)
@@ -368,7 +794,7 @@ class Station:
                 self.stop("Both serial ports identify as the same MCU", invalid=True)
                 return
             if not hasattr(self, "capabilities"): self.capabilities = {}
-            self.capabilities[role] = {"i2c_simulators": frame.get("i2c_simulators"), "adc_levels": frame.get("adc_levels")}
+            self.capabilities[role] = {key: frame.get(key) for key in ("i2c_simulators", "adc_levels", "io_pwm", "session_stop", "sbus_out", "usb_restore")}
             self.identities[role] = {"device_id": device_id, "firmware": firmware}
             self.hello[role] = True
             self.last_seen[role] = received_at
@@ -449,7 +875,8 @@ class Station:
                 self.demo_sequence = 0
                 self.note("Waveform output enabled after external interface checks")
         elif kind == "sample" and role == "probe" and self.phase == "RUNNING":
-            if self.assessment.accept(frame, received_at):
+            indices = self.gpio_indices()
+            if (indices is None or frame.get("channel") in indices) and self.assessment.accept(frame, received_at):
                 self.last_seen[role] = received_at
         elif kind == "heartbeat" and frame.get("session") == self.assessment.session and frame.get("running") is True:
             self.last_seen[role] = received_at
@@ -460,6 +887,7 @@ class Station:
         self.demo = True
         self.hello = {"source": True, "probe": True}
         self.identities = {role: {"device_id": f"DEMO_{role.upper()}", "firmware": "SIMULATED"} for role in ("source", "probe")}
+        self.capabilities = {role: {"i2c_simulators": 2, "adc_levels": 2, "io_pwm": 1, "session_stop": 1, "sbus_out": 1} for role in ("source", "probe")}
         self.note("DEMO ONLY — generated frequencies, no hardware connected")
         self.populate_demo_power()
         self.start()
@@ -487,17 +915,35 @@ class Station:
         self.demo_sequence += 1
         self.last_seen = {"source": now, "probe": now}
         for index, row in enumerate(self.profile["channels"]):
+            indices = self.gpio_indices()
+            if indices is not None and index not in indices: continue
             if row.get("method") == "adc_voltage":
                 result = self.assessment.results[index]
-                result.status, result.reason = "PASS", "DEMO: 0 V / 1.65 V ADC levels"
-                result.voltage_low_mv, result.voltage_high_mv = 0, 1650
-                for mode, value in zip(ADC_MODES, (0, 1650)):
+                modes = ADC_CHANNEL_MODES[row["id"]]
+                high = TESTS[modes[1]]["expected_mv"]
+                result.status, result.reason = "PASS", "DEMO: simulated ADC voltage levels"
+                result.voltage_low_mv, result.voltage_high_mv = 0, high
+                for mode, value in zip(modes, (0, high)):
                     self.i2c_results[mode] = {"status": "PASS", "reason": "DEMO voltage", "adc_voltage_mv": value}
                 continue
             frequency = row["expected_hz"] * (1.10 if self.demo_fault.get() and index == 0 else 1)
             edges = max(3, int(frequency) + 1)
             span = round((edges - 1) * 1_000_000 / frequency)
             self.assessment.accept({"type": "sample", "session": self.assessment.session, "seq": self.demo_sequence, "channel": index, "frequency_millihz": (edges - 1) * 1_000_000_000 // span, "edges": edges, "span_us": span, "timing_errors": 0}, now)
+
+    def demo_protocol_samples(self, now):
+        run = self.i2c_run
+        if run.phase != "RUNNING" or now - self.last_demo < 1: return
+        self.last_demo = now
+        spec = TESTS[run.mode]
+        if run.mode == "ETH":
+            run.host_rx += 20; run.last_host = now; run.result.host_rx = run.host_rx
+        for role in (name for name in ("probe", "source") if name in run.started):
+            previous = run.samples.get(role, {})
+            detail = spec["stimulus_mv" if role == "probe" else "expected_mv"] if spec.get("kind") == "adc" else round(spec["expected_hz"] * 1000) if spec.get("kind") in ("io_pwm", "sbus_out") else 1 if run.mode == "ETH" else 3 if run.mode == "CAN" else 0
+            run.handle(role, {"type": "protocol_sample", "session": run.session, "mode": run.mode,
+                              "seq": previous.get("seq", 0) + 1, "tx": previous.get("tx", 0) + 20,
+                              "rx": previous.get("rx", 0) + 20, "errors": 0, "pass": True, "detail": detail}, now)
 
     def pump(self):
         if self.closing:
@@ -517,6 +963,7 @@ class Station:
                 except queue.Empty:
                     break
                 self.handle(role, frame)
+            self.poll_preparation()
             now = time.monotonic()
             if self.phase == "RUNNING":
                 if self.demo:
@@ -528,7 +975,7 @@ class Station:
                 if any(now - self.last_seen.get(role, 0) > 2.5 for role in ("source", "probe")):
                     self.stop("Endpoint heartbeat timeout", invalid=True)
                 else:
-                    self.assessment.expire(now)
+                    self.assessment.expire(now, indices=self.gpio_indices())
                     passed = sum(row.status == "PASS" for row in self.assessment.results)
                     failed = sum(row.status == "FAIL" for row in self.assessment.results)
                     self.state.set(("DEMO — " if self.demo else "") + ("GPIO FREQUENCY CHANNELS PASS" if self.assessment.all_passed else f"RUNNING · {passed} PASS · {failed} FAIL"))
@@ -540,52 +987,84 @@ class Station:
                 if now - self.phase_started > (20 if self.phase in ("CHECKING", "CONNECTING") else 5):
                     self.stop("Startup or USB handshake timed out", invalid=True)
             if self.phase == "RUNNING" and getattr(self, "suite_active", False):
-                if self.suite_gpio_started is None: self.suite_gpio_started = now
-                if now - self.suite_gpio_started >= 6:
-                    snapshot = self.report_snapshot(now)
-                    self.stop("GPIO measurements completed; starting I2C slave checks")
-                    self.gpio_snapshot = snapshot
-                    self._start_connector_modes(list(I2C_MODES + ADC_MODES))
-                    self.suite_active = self.phase == "I2C_RUNNING"
+                self.advance_gpio_sequence(now)
+            elif self.phase == "STOPPING_GPIO":
+                self.poll_gpio_stop(now)
             elif self.phase == "I2C_RUNNING":
+                if self.demo: self.demo_protocol_samples(time.monotonic())
+                if getattr(self, "ethernet", None) is not None:
+                    self.ethernet.pump(self.i2c_run, time.monotonic())
                 self.i2c_run.tick(time.monotonic())
                 self._update_i2c()
+            child = getattr(self, "protocol_window", None)
+            if child is not None and not child.closed:
+                self.state.set("Connector protocol tests · " + child.status.get())
+            self.poll_completion()
             self.draw_results()
-        except (ValueError, RuntimeError) as error:
+        except (ValueError, RuntimeError, OSError) as error:
             self.stop(str(error), invalid=True)
-        self.root.after(70, self.pump)
+        self.pump_after_id = self.root.after(70, self.pump)
 
     def draw_results(self):
         self.view.render()
 
     def report_snapshot(self, now=None):
+        if getattr(self, "completed_report", None) is not None:
+            return {**deepcopy(self.completed_report), "usb_connected": {role: role in self.hello for role in ("source", "probe")}}
         now = time.monotonic() if now is None else now
         if self.phase == "RUNNING":
             if now - self.last_pump_at > self.profile["lease_ms"] / 1000 or (self.last_ping and now - self.last_ping > self.profile["lease_ms"] / 1000) or any(now - self.last_seen.get(role, 0) > 2.5 for role in ("source", "probe")):
                 self.stop("Measurement or heartbeat expired before export", invalid=True)
-            self.assessment.expire(now)
+            self.assessment.expire(now, indices=self.gpio_indices())
         rows = [{**channel, **asdict(result)} for channel, result in zip(self.profile["channels"], self.assessment.results)]
         metadata = {"utc": datetime.now(timezone.utc).isoformat(), "demo": self.demo, "session": self.assessment.session, "profile_sha256": self.digest, "run_state": self.phase, "startup_checks": deepcopy(self.checked), "startup_check_details": deepcopy(self.check_details), "devices": deepcopy(self.identities), "peripherals": self.peripherals.snapshot(), "all_passed": self.phase == "RUNNING" and self.assessment.all_passed and self.peripherals.passed() and self.peripherals.current_passed}
         metadata["external_passed"] = self.phase == "RUNNING" and self.assessment.all_passed and all(self.checked.get(role) for role in ("source", "probe"))
         metadata["onboard_passed"] = self.peripherals.passed(("source",)) and self.peripherals.current_passed
-        if getattr(self, "gpio_snapshot", None) and self.phase in ("I2C_RUNNING", "I2C_COMPLETE", "COMPLETE"):
+        if getattr(self, "gpio_snapshot", None) and self.phase in ("I2C_RUNNING", "I2C_COMPLETE", "COMPLETE", "WAITING_IOV2", "WAITING_ETH"):
             rows = deepcopy(self.gpio_snapshot["channels"])
             for index, row in enumerate(rows):
                 if row.get("method") == "adc_voltage": row.update(asdict(self.assessment.results[index]))
         results = getattr(self, "i2c_results", {})
         metadata["connector_tests"] = deepcopy(results)
+        metadata["selected_connector_modes"] = list(getattr(self, "connector_modes", ()))
+        metadata["selected_connector_results"] = deepcopy({mode: results[mode] for mode in metadata["selected_connector_modes"] if mode in results})
         metadata["i2c_tests"] = deepcopy({k: v for k, v in results.items() if k in I2C_MODES})
         metadata["adc_tests"] = deepcopy({k: v for k, v in results.items() if k in ADC_MODES})
         metadata["adc_passed"] = set(metadata["adc_tests"]) == set(ADC_MODES) and all(r["status"] == "PASS" for r in metadata["adc_tests"].values())
         metadata["test_suite_completed"] = getattr(self, "suite_completed", False)
+        metadata["extended_suite"] = getattr(self, "extended_suite", False)
+        metadata["iov2_tests"] = deepcopy({mode: results[mode] for mode in IO_MODES if mode in results})
+        metadata["iov2_passed"] = len(metadata["iov2_tests"]) == 8 and all(row["status"] == "PASS" and row.get("outputs_stopped") for row in metadata["iov2_tests"].values())
+        metadata["ethernet_test"] = deepcopy(results.get("ETH", {}))
+        metadata["sbus_out_test"] = deepcopy(results.get("SBUS_OUT", {}))
+        metadata["sbus_out_passed"] = results.get("SBUS_OUT", {}).get("status") == "PASS" and results["SBUS_OUT"].get("outputs_stopped") is True
+        panel = getattr(getattr(self, "view", None), "network_panel", None)
+        metadata["pc_ethernet"] = panel.snapshot() if panel else {}
+        metadata["ethernet_passed"] = results.get("ETH", {}).get("status") == "PASS" and results["ETH"].get("outputs_stopped") is True
+        metadata["can_test"] = deepcopy(results.get("CAN", {}))
+        metadata["can_passed"] = results.get("CAN", {}).get("status") == "PASS" and results["CAN"].get("outputs_stopped") is True
+        metadata["gpio_stages"] = deepcopy(getattr(getattr(self, "gpio_sequence", None), "completed", {}))
+        metadata["selected_gpio_groups"] = list(getattr(getattr(self, "gpio_sequence", None), "groups", ()))
+        metadata["selected_gpio_passed"] = bool(metadata["gpio_stages"]) and set(metadata["gpio_stages"]) == set(metadata["selected_gpio_groups"]) and all(
+            row["status"] == "PASS" for rows in metadata["gpio_stages"].values() for row in rows)
         metadata["gpio_measurement_completed"] = getattr(self, "gpio_snapshot", None) is not None
+        stopped = getattr(self, "gpio_stop", None)
+        metadata["gpio_outputs_stopped"] = bool(stopped and stopped.done and not stopped.error and stopped.confirmed == {"source", "probe"})
+        metadata["gpio_stop_confirmed_roles"] = sorted(stopped.confirmed) if stopped else []
+        metadata["gpio_stop_error"] = stopped.error if stopped else ""
         metadata["i2c_passed"] = set(metadata["i2c_tests"]) == set(I2C_MODES) and all(r["status"] == "PASS" for r in metadata["i2c_tests"].values())
         metadata["external_suite_passed"] = metadata["test_suite_completed"] and all(row["status"] == "PASS" for row in rows) and metadata["i2c_passed"] and metadata["adc_passed"]
+        if metadata["extended_suite"]:
+            metadata["external_suite_passed"] = metadata["external_suite_passed"] and metadata["iov2_passed"] and metadata["sbus_out_passed"] and metadata["ethernet_passed"] and metadata["can_passed"]
         metadata["all_passed"] = metadata["external_suite_passed"] and metadata["onboard_passed"]
         return {**metadata, "channels": rows}
 
     def export(self):
-        # Freeze a validated snapshot before a native file dialog can pause Tk.
+        if not self.network_idle() or self.network_busy():
+            self.note("Stop the active test and wait for output shutdown before exporting.")
+            return
+        # File dialogs can pause Tk on Windows. Only open one while outputs
+        # are idle, after freezing the complete report.
         report = self.report_snapshot()
         filename = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON report", "*.json"), ("CSV report", "*.csv")], initialfile="pixnova-io-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".json")
         if not filename:
@@ -594,20 +1073,15 @@ class Station:
         try:
             csv_report = filename.lower().endswith(".csv")
             destination = Path(filename)
-            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8-sig" if csv_report else "utf-8", newline="",
+            if csv_report:
+                save_csv(report, destination.parent, destination)
+            else:
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="",
                                              dir=destination.parent, prefix="." + destination.name + ".", suffix=".tmp", delete=False) as output:
-                temporary = Path(output.name)
-                if csv_report:
-                    metadata = {key: json.dumps(value) if isinstance(value, (dict, list)) else value for key, value in report.items() if key != "channels"}
-                    data = [{**metadata, **row} for row in report["channels"]]
-                    columns = list(dict.fromkeys(key for row in data for key in row))
-                    writer = csv.DictWriter(output, fieldnames=columns)
-                    writer.writeheader()
-                    writer.writerows(data)
-                else:
+                    temporary = Path(output.name)
                     json.dump(report, output, indent=2, allow_nan=False)
-            os.replace(temporary, destination)
-            temporary = None
+                os.replace(temporary, destination)
+                temporary = None
             self.note(f"Report saved: {filename}")
         except (OSError, ValueError) as error:
             messagebox.showerror("Export failed", str(error))
@@ -619,9 +1093,29 @@ class Station:
                     pass
 
     def close(self):
+        if self.closing: return
+        if self.phase == "FINISHING":
+            self.note("Wait for firmware restoration to finish before closing."); return
+        if self.phase == "STOPPING_GPIO":
+            self.suite_active = self.auto_start = False
+            self.gpio_followup = self.close
+            return
+        if self.defer_gpio_stop(self.close, "Closing station"): return
+        if self.phase == "I2C_RUNNING":
+            self.stop("Closing station")
+            self.root.after(100, self.close)
+            return
+        child = getattr(self, "protocol_window", None)
+        if child is not None and not child.closed:
+            child.close()
+            if not child.closed:
+                self.root.after(100, self.close)
+                return
         self.closing = True
-        if getattr(self, "protocol_window", None) and not self.protocol_window.closed:
-            self.protocol_window.close()
+        self.prepare_worker = None
+        self.root.after_cancel(self.pump_after_id)
+        self.view.network_panel.close()
+        self.close_ethernet()
         for link in self.links.values():
             link.close()
         for link in self.links.values():
@@ -633,14 +1127,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", type=Path, default=Path(__file__).with_name("profile.json"))
     parser.add_argument("--demo", action="store_true", help="Simulated frequencies; no serial hardware access")
-    parser.add_argument("--protocols", action="store_true", help="Open the connector protocol station")
+    view = parser.add_mutually_exclusive_group()
+    view.add_argument("--protocols", action="store_true", help="Open the connector protocol station")
+    view.add_argument("--iov2", action="store_true", help="Open the ordinary station at the independent IOV2 PWM page")
+    view.add_argument("--ethernet", action="store_true", help="Open the ordinary station at the Ethernet page")
     args = parser.parse_args()
     root = tk.Tk()
     if args.protocols:
         from protocol_app import ProtocolStation
         ProtocolStation(root, args.profile, args.demo)
     else:
-        Station(root, args.profile, args.demo)
+        station = Station(root, args.profile, args.demo)
+        if args.iov2:
+            station.view.filter("IOV2 PWM")
+        elif args.ethernet:
+            station.view.select_connector_group("Ethernet")
     root.mainloop()
 
 

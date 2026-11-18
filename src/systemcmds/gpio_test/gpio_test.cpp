@@ -6,6 +6,7 @@
 #include <px4_platform_common/tasks.h>
 #include <px4_platform_common/atomic.h>
 #include <px4_platform_common/board_common.h>
+#include <px4_platform_common/shutdown.h>
 #include <px4_platform/gpio.h>
 #include <drivers/drv_hrt.h>
 #include <lib/version/version.h>
@@ -70,7 +71,7 @@ public:
 
 private:
 	uint32_t pin(unsigned index, bool output) const;
-	void stop();
+	bool stop();
 	bool configure(bool output);
 	void tick();
 	void command(char *line);
@@ -134,22 +135,23 @@ bool Endpoint::configure(bool output)
 	return ok;
 }
 
-void Endpoint::stop()
+bool Endpoint::stop()
 {
+	bool ok = true;
 #ifdef CONFIG_GPIO_TEST_PROTOCOLS
-	_protocol.stop();
+	ok = _protocol.stop();
 	_protocol_checked = false;
 	_checked_mode = protocol_test::Mode::None;
 #endif
 	hrt_cancel(&_call);
 	_active = false;
 	_checked = false;
-	configure(false);
+	return configure(false) && ok;
 }
 
 bool Endpoint::send(const char *format, ...)
 {
-	char buffer[384];
+	char buffer[512];
 	va_list args;
 	va_start(args, format);
 	const int size = vsnprintf(buffer, sizeof(buffer), format, args);
@@ -292,6 +294,29 @@ void Endpoint::command(char *line)
 		return;
 	}
 
+	if (strncmp(line, "BOOTLOADER", 10) == 0) {
+		char verb[16] {}, target[81] {}, extra{}; // Host identities permit at most 80 hex characters.
+		char guid[PX4_GUID_FORMAT_SIZE] {};
+		board_get_px4_guid_formated(guid, sizeof(guid));
+		const int count = sscanf(line, "%15s %80s %c", verb, target, &extra);
+		bool idle = !_active;
+#ifdef CONFIG_GPIO_TEST_PROTOCOLS
+		idle = idle && !_protocol.active();
+#endif
+
+		if (RECEIVER || count != 2 || strcmp(verb, "BOOTLOADER") != 0 || strcmp(target, guid) != 0 || !idle || !stop()) {
+			send("{\"type\":\"error\",\"reason\":\"bootloader_requires_idle_source_identity\"}\n");
+			return;
+		}
+
+		if (send("{\"type\":\"bootloader\",\"device_id\":\"%s\"}\n", guid)) {
+			usleep(100000); // Allow the USB acknowledgement to leave before reset.
+			board_reset(REBOOT_TO_BOOTLOADER);
+		}
+
+		return;
+	}
+
 	char verb[16] {}, session[33] {}, profile[65] {}, extra{};
 	const int fields = sscanf(line, "%15s %32s %64s %c", verb, session, profile, &extra);
 
@@ -367,18 +392,23 @@ void Endpoint::command(char *line)
 		board_get_px4_guid_formated(guid, sizeof(guid));
 		send("{\"type\":\"hello\",\"role\":\"%s\",\"protocol\":%u,\"profile\":\"%s\",\"channels\":%u,\"device_id\":\"%s\",\"firmware\":\"%016llx\""
 #ifdef CONFIG_GPIO_TEST_PROTOCOLS
-		     ",\"protocol_tests\":1,\"i2c_simulators\":2,\"adc_levels\":1"
+		     ",\"protocol_tests\":1,\"i2c_simulators\":2,\"adc_levels\":2,\"io_pwm\":1,\"session_stop\":1,\"sbus_out\":1"
 #endif
-		     ",\"independent_external_checks\":1}\n",
+		     ",\"independent_external_checks\":1,\"usb_restore\":%u}\n",
 		     ROLE, GPIO_TEST_PROTOCOL, GPIO_TEST_PROFILE_SHA, GPIO_TEST_COUNT, guid,
-		     static_cast<unsigned long long>(px4_firmware_version_binary()));
+		     static_cast<unsigned long long>(px4_firmware_version_binary()), RECEIVER ? 0u : 1u);
 		send_power_on();
 		return;
 	}
 
-	if (fields == 1 && strcmp(verb, "STOP") == 0) {
-		stop();
-		send("{\"type\":\"stopped\",\"session\":\"%s\",\"reason\":\"requested\"}\n", _session);
+	bool stop_session = fields == 2 && strlen(session) == 32;
+
+	for (const char *p = session; *p; ++p) { stop_session = stop_session && isxdigit(static_cast<unsigned char>(*p)); }
+
+	if ((fields == 1 || stop_session) && strcmp(verb, "STOP") == 0) {
+		const bool stopped = stop();
+		send("{\"type\":\"stopped\",\"session\":\"%s\",\"reason\":\"%s\"}\n", stop_session ? session : _session,
+		     stopped ? "requested" : "cleanup_failed");
 		return;
 	}
 
@@ -578,12 +608,14 @@ void Endpoint::run()
 				ProtocolSample sample{};
 
 				if (_protocol.update(sample)) {
-					send("{\"type\":\"protocol_sample\",\"session\":\"%s\",\"mode\":\"%s\",\"seq\":%lu,\"tx\":%lu,\"rx\":%lu,\"errors\":%lu,\"detail\":%d,\"pass\":%s,\"channels\":[%u,%u,%u,%u,%u,%u,%u]}\n",
+					send("{\"type\":\"protocol_sample\",\"session\":\"%s\",\"mode\":\"%s\",\"seq\":%lu,\"tx\":%lu,\"rx\":%lu,\"errors\":%lu,\"detail\":%d,\"pass\":%s,\"channels\":[%u,%u,%u,%u,%u,%u,%u],\"capture\":[%ld,%ld,%ld,%ld,%ld]}\n",
 					     _session, protocol_test::name(_protocol.mode()), static_cast<unsigned long>(sample.sequence),
 					     static_cast<unsigned long>(sample.tx), static_cast<unsigned long>(sample.rx),
 					     static_cast<unsigned long>(sample.errors), sample.detail, sample.passed ? "true" : "false",
 					     sample.channels[0], sample.channels[1], sample.channels[2], sample.channels[3],
-					     sample.channels[4], sample.channels[5], sample.channels[6]);
+					     sample.channels[4], sample.channels[5], sample.channels[6],
+					     static_cast<long>(sample.capture[0]), static_cast<long>(sample.capture[1]), static_cast<long>(sample.capture[2]),
+					     static_cast<long>(sample.capture[3]), static_cast<long>(sample.capture[4]));
 				}
 			}
 		}

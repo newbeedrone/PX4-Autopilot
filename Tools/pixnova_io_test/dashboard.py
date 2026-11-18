@@ -48,6 +48,7 @@ class Action(tk.Canvas):
         super().__init__(parent, width=width, height=36, bg=parent.cget("bg"),
                          highlightthickness=0, cursor="hand2", takefocus=True)
         self.text, self.command = text, command
+        self.enabled = True
         self.fill = "#357ee8" if primary else "#362032" if danger else "#1a2a41"
         self.hover = "#4990fa" if primary else "#4c263c" if danger else "#263b56"
         self.fg = "#ffffff" if primary else RED if danger else TEXT
@@ -63,11 +64,18 @@ class Action(tk.Canvas):
     def paint(self, hover=False):
         self.delete("all")
         width = self.winfo_width()
-        rounded(self, 1, 1, width - 1, 35, radius=8, fill=self.hover if hover else self.fill,
+        rounded(self, 1, 1, width - 1, 35, radius=8, fill=(self.hover if hover else self.fill) if self.enabled else INSET,
                 outline=BLUE if self.focus_get() == self else "")
-        self.create_text(width / 2, 18, text=self.text, fill=self.fg, font=(FONT, 10, "bold"))
+        self.create_text(width / 2, 18, text=self.text, fill=self.fg if self.enabled else MUTED, font=(FONT, 10, "bold"))
+
+    def set_enabled(self, enabled):
+        if self.enabled != enabled:
+            self.enabled = enabled
+            self.configure(cursor="hand2" if enabled else "arrow")
+            self.paint()
 
     def invoke(self):
+        if not self.enabled: return
         self.focus_set()
         self.command()
 
@@ -122,7 +130,9 @@ class PortMap(tk.Canvas):
         view, station = self.dashboard, self.dashboard.station
         results = station.assessment.results
         signature = (self.winfo_width(), view.filter_group, view.faults_only, view.selected,
-                     tuple((r.status, r.frequency_hz, r.voltage_low_mv, r.voltage_high_mv) for r in results))
+                     tuple((r.status, r.frequency_hz, r.voltage_low_mv, r.voltage_high_mv) for r in results),
+                     tuple((mode, row.get("status"), row.get("frequency_hz"), row.get("probe_rx"), row.get("reason"))
+                           for mode, row in station.i2c_results.items() if mode in getattr(view, "iov2_cards", {})))
         if signature == self.signature and not force:
             return
         self.signature = signature
@@ -139,18 +149,111 @@ class PortMap(tk.Canvas):
                 continue
             column = min(range(columns), key=lambda col: heights[col])
             height = 132 + self.ROW_HEIGHT * len(indices)
+            connector = station.profile["channels"][indices[0]]["probe_connector"]
+            height += 38 * sum(bool(pin.get("note")) for pin in view.connectors[connector]["pins"])
             self.card(column * (card_width + 12), heights[column], card_width, height, group, indices)
             heights[column] += height + 12
             visible += 1
+        io_failed = any(station.i2c_results.get(f"IO_PWM{i}", {}).get("status") == "FAIL" for i in range(1, 9))
+        if view.filter_group in (None, "IOV2 PWM") and (not view.faults_only or io_failed):
+            column = min(range(columns), key=lambda col: heights[col])
+            height = self.io_card(column * (card_width + 12), heights[column], card_width)
+            heights[column] += height + 12
+            visible += 1
+        sbus_status = station.i2c_results.get("SBUS_OUT", {}).get("status", "NOT RUN")
+        if view.filter_group in (None, "SBUS OUT") and (not view.faults_only or sbus_status == "FAIL"):
+            column = min(range(columns), key=lambda col: heights[col])
+            self.sbus_card(column * (card_width + 12), heights[column], card_width)
+            heights[column] += 246
+            visible += 1
         if not visible:
-            self.create_text(width / 2, 100, text="No failed pins" if view.faults_only else "No ports selected",
-                             fill=GREEN if view.faults_only else MUTED, font=(FONT, 16, "bold"))
-            self.create_text(width / 2, 133, text="Pin diagrams update with each measurement window.",
+            io_fault = view.faults_only and any(station.i2c_results.get(mode, {}).get("status") == "FAIL" for mode in view.iov2_cards)
+            self.create_text(width / 2, 100, text="IOV2 faults shown above" if io_fault else "No failed pins" if view.faults_only else "No ports selected",
+                             fill=RED if io_fault else GREEN if view.faults_only else MUTED, font=(FONT, 16, "bold"))
+            self.create_text(width / 2, 133, text="Select an IOV2 card to inspect the output." if io_fault else "Pin diagrams update with each measurement window.",
                              fill=MUTED, font=(FONT, 10))
         self.configure(scrollregion=(0, 0, width, max(heights) + 8))
 
     def select_pin(self, index):
         self.dashboard.select(index)
+
+    def select_io_pin(self, mode):
+        self.dashboard.filter("IOV2 PWM")
+        self.dashboard.select_iov2(mode)
+
+    def io_card(self, x, y, width):
+        from protocol_model import TESTS
+        view = self.dashboard
+        modes = [mode for mode, spec in TESTS.items() if spec.get("kind") == "io_pwm"]
+        results = {mode: view.station.i2c_results.get(mode, {}) for mode in modes}
+        failed = sum(result.get("status") == "FAIL" for result in results.values())
+        passed = sum(result.get("status") == "PASS" for result in results.values())
+        color = RED if failed else GREEN if passed == len(modes) else MUTED
+        height = 132 + len(modes) * self.ROW_HEIGHT
+        rounded(self, x, y, x + width, y + height, fill=PANEL, outline=RED if failed else BORDER)
+        self.create_text(x + 14, y + 23, text="IOV2 PWM", anchor="w", fill=TEXT, font=(FONT, 12, "bold"))
+        self.create_text(x + width - 14, y + 23, text=f"{failed} FAIL" if failed else f"{passed}/8", anchor="e", fill=color, font=(MONO, 9, "bold"))
+        self.create_text(x + 14, y + 48, text="PROBE P21 · IO PWM FREQUENCY", anchor="w", fill=MUTED, font=(FONT, 8))
+        positions = view.connectors["P21"]["pins"]
+        by_pin = {TESTS[mode]["probe_connector_pin"]: mode for mode in modes}
+        gap = 5
+        pin_width = min(29, (width - 28 - gap * (len(positions) - 1)) / len(positions))
+        for offset, pin in enumerate(positions):
+            px = x + 14 + offset * (pin_width + gap)
+            mode = by_pin.get(pin["number"])
+            status = results[mode].get("status", "NOT RUN") if mode else None
+            fg, fill = STATE_COLORS[status] if mode else (MUTED, INSET)
+            tag = f"protocol-pin:{mode}" if mode else f"excluded:P21:{pin['number']}"
+            rounded(self, px, y + 63, px + pin_width, y + 91, radius=5, fill=fill,
+                    outline=fg if mode == view.selected_iov2 or status == "FAIL" else BORDER,
+                    tags=(tag, f"protocol-pin-fill:{mode}"))
+            self.create_text(px + pin_width / 2, y + 77, text=str(pin["number"]), fill=fg, font=(MONO, 9, "bold"), tags=(tag,))
+            if mode: self.tag_bind(tag, "<Button-1>", lambda _, key=mode: self.select_io_pin(key))
+        self.create_text(x + 14, y + 112, text="IO OUTPUT", anchor="w", fill=MUTED, font=(FONT, 8))
+        self.create_text(x + width * .49, y + 112, text="IO → PROBE", fill=MUTED, font=(FONT, 8))
+        self.create_text(x + width - 14, y + 112, text="Hz", anchor="e", fill=MUTED, font=(FONT, 8))
+        for offset, mode in enumerate(modes):
+            spec, result = TESTS[mode], results[mode]
+            fg, fill = STATE_COLORS[result.get("status", "NOT RUN")]
+            ry, tag = y + 132 + offset * self.ROW_HEIGHT, f"protocol-row:{mode}"
+            if result.get("status") == "FAIL" or view.selected_iov2 == mode:
+                rounded(self, x + 7, ry - 12, x + width - 7, ry + 13, radius=5, fill=fill, outline="", tags=(tag,))
+            self.create_text(x + 14, ry, text=f"PWM{spec['channel']}", anchor="w", fill=fg, font=(FONT, 9), tags=(tag,))
+            self.create_text(x + width * .49, ry, text=f"{spec['source_io_pin']} → {spec['probe_pin']}", fill=fg, font=(MONO, 9), tags=(tag,))
+            rate = result.get("frequency_hz")
+            self.create_text(x + width - 14, ry, text=f"{rate:.2f}" if rate is not None else "—", anchor="e", fill=fg, font=(MONO, 9), tags=(tag,))
+            self.tag_bind(tag, "<Button-1>", lambda _, key=mode: self.select_io_pin(key))
+        return height
+
+    def sbus_card(self, x, y, width):
+        view = self.dashboard
+        result = view.station.i2c_results.get("SBUS_OUT", {})
+        status = result.get("status", "NOT RUN")
+        color, fill = STATE_COLORS[status]
+        rounded(self, x, y, x + width, y + 234, fill=PANEL, outline=color if status == "FAIL" else BORDER)
+        self.create_text(x + 14, y + 23, text="SBUS OUT", anchor="w", fill=TEXT, font=(FONT, 12, "bold"))
+        self.create_text(x + width - 14, y + 23, text=status, anchor="e", fill=color, font=(MONO, 9, "bold"))
+        self.create_text(x + 14, y + 48, text="PROBE P8 · SBUS RECEIVER", anchor="w", fill=MUTED, font=(FONT, 8))
+        for offset, pin in enumerate(view.connectors["P8"]["pins"]):
+            px = x + 14 + offset * 55
+            signal = pin["number"] == 2
+            fg, bg = (color, fill) if signal else (MUTED, INSET)
+            tag = f"protocol-pin:SBUS_OUT:{pin['number']}"
+            rounded(self, px, y + 63, px + 40, y + 91, radius=5, fill=bg, outline=fg if signal else BORDER,
+                    tags=(tag, f"protocol-pin-fill:SBUS_OUT:{pin['number']}"))
+            self.create_text(px + 20, y + 77, text=str(pin["number"]), fill=fg, font=(MONO, 9, "bold"), tags=(tag,))
+            self.create_text(px + 20, y + 104, text="PG5" if signal else "GND" if pin["number"] == 3 else "POWER",
+                             fill=fg, font=(MONO, 8))
+            if signal:
+                self.tag_bind(tag, "<Button-1>", lambda _: view.filter("SBUS OUT"))
+        self.create_text(x + 14, y + 132, text="IO PB10 → PG5", anchor="w", fill=color, font=(MONO, 10, "bold"))
+        rate = result.get("frequency_hz")
+        self.create_text(x + width - 14, y + 132, text=f"{rate:.2f} fps" if rate is not None else "— fps",
+                         anchor="e", fill=color, font=(MONO, 9))
+        self.create_text(x + 14, y + 158, text=f"Decoded frames: {result.get('probe_rx', 0)} · 100 kbaud 8E2",
+                         anchor="w", fill=color, font=(FONT, 8))
+        self.create_text(x + 14, y + 180, text=result.get("reason", "Select SBUS OUT at left; use Test SBUS OUT above."),
+                         anchor="nw", width=width - 28, fill=color, font=(FONT, 8))
 
     def card(self, x, y, width, height, group, indices):
         view, station = self.dashboard, self.dashboard.station
@@ -203,6 +306,11 @@ class PortMap(tk.Canvas):
                 measured = f"{result.voltage_high_mv / 1000:.3f} V" if result.voltage_high_mv is not None else "—"
             self.create_text(x + width - 14, ry, text=measured, anchor="e", fill=fg, font=(MONO, 9), tags=(tag,))
             self.tag_bind(tag, "<Button-1>", lambda _, i=index: self.select_pin(i))
+        for offset, pin in enumerate(pin for pin in positions if pin.get("note")):
+            ry = y + 132 + len(indices) * self.ROW_HEIGHT + offset * 38
+            tag = f"protected:{connector}:{pin['number']}"
+            self.create_text(x + 14, ry, text=f"{pin['label']} · {connector}.{pin['number']}", anchor="w", fill=MUTED, font=(FONT, 8, "bold"), tags=(tag,))
+            self.create_text(x + 14, ry + 15, text=pin["note"], anchor="w", fill=MUTED, font=(FONT, 8), tags=(tag,))
 
 
 class Dashboard:
@@ -214,6 +322,7 @@ class Dashboard:
         for index, row in enumerate(station.profile["channels"]):
             self.groups.setdefault(row["group"], []).append(index)
         self.selected, self.filter_group, self.faults_only = 0, None, False
+        self.selected_iov2 = None
         self.nav_items, self.metric_labels = {}, {}
         self._inspector_signature = None
         self.selected_sensor = None
@@ -242,6 +351,8 @@ class Dashboard:
         self._nav(sidebar, "All ports", None)
         self._nav(sidebar, "Failed pins", "failed")
         label(sidebar, "CONNECTORS", size=8, color=MUTED).pack(anchor="w", padx=20, pady=(22, 8))
+        self._nav(sidebar, "IOV2 PWM", "IOV2 PWM")
+        self._nav(sidebar, "SBUS OUT", "SBUS OUT")
         for group in self.groups:
             self._nav(sidebar, group, group)
         protected = tk.Frame(sidebar, bg=SIDEBAR)
@@ -261,17 +372,20 @@ class Dashboard:
         actions.pack(side="right")
         if self.station.demo:
             label(actions, "DEMO / SIMULATED", color=AMBER, bold=True, size=9).pack(side="left", padx=14)
-        Action(actions, "Export report", self.station.export, width=112).pack(side="left", padx=(0, 8))
+        self.export_action = Action(actions, "Export report", self.station.export, width=112)
+        self.export_action.pack(side="left", padx=(0, 8))
         Action(actions, "Protocols", self.station.open_protocols, width=100).pack(side="left", padx=(0, 8))
         Action(actions, "■  Stop", self.station.stop, width=80, danger=True).pack(side="left", padx=(0, 8))
         Action(actions, "▶  Start test", self.station.start_full_test, width=122, primary=True).pack(side="left")
         self._connections(body)
+        from completion import CompletionPanel
+        self.completion = CompletionPanel(body, self.station)
         self._peripherals(body)
         self._i2c_tests(body)
         metrics = tk.Frame(body, bg=BG)
         metrics.pack(fill="x", pady=(14, 16))
         for column, (name, caption, color) in enumerate([
-                ("total", "TEST INPUTS", TEXT), ("pass", "PASSED", GREEN),
+                ("total", "TEST SIGNALS", TEXT), ("pass", "PASSED", GREEN),
                 ("fail", "FAILED", RED), ("pending", "PENDING", AMBER)]):
             metrics.columnconfigure(column, weight=1, uniform="metric")
             card = tk.Frame(metrics, bg=PANEL, highlightbackground=BORDER, highlightthickness=1)
@@ -324,8 +438,8 @@ class Dashboard:
 
     def _nav(self, parent, text, key):
         row = tk.Frame(parent, bg=SIDEBAR, cursor="hand2")
-        row.pack(fill="x", padx=10, pady=2)
-        title = label(row, text, size=10, color=MUTED, padx=10, pady=7, anchor="w")
+        row.pack(fill="x", padx=10, pady=1)
+        title = label(row, text, size=10, color=MUTED, padx=10, pady=6, anchor="w")
         title.pack(side="left", fill="x", expand=True)
         count = label(row, "", size=9, color=MUTED, padx=10)
         count.pack(side="right")
@@ -356,17 +470,23 @@ class Dashboard:
         Action(inside, "Self-check", self.station.self_check, width=100).pack(side="left", pady=(17, 0))
         status_row = tk.Frame(box, bg=INSET)
         status_row.pack(fill="x")
-        self.state_label = label(status_row, variable=self.station.state, color=BLUE, size=9, anchor="w", padx=14, pady=8)
+        self.state_label = label(status_row, variable=self.station.state, color=BLUE, size=10, bold=True, anchor="w", justify="left", padx=14, pady=8)
         self.state_label.pack(fill="x")
+        self.state_label.bind("<Configure>", lambda event: self.state_label.configure(wraplength=max(240, event.width - 28)))
 
     def _i2c_tests(self, parent):
         from protocol_model import TESTS
         section = tk.Frame(parent, bg=BG)
         section.pack(fill="x", pady=(12, 0))
-        label(section, "I2C SCL / SDA · SIMULATED SLAVE  |  ADC6V6 · 0 V / 3.3 V STIMULUS", size=9, bold=True).pack(anchor="w")
-        label(section, "UART, buzzer and other digital signals use the GPIO frequency tests below.",
-              size=8, color=MUTED).pack(anchor="w", pady=(2, 0))
+        tabs = tk.Frame(section, bg=BG); tabs.pack(fill="x")
+        self.connector_group, self.connector_buttons = "I2C / ADC", {}
+        for group in ("I2C / ADC", "CAN", "IOV2 PWM", "Ethernet"):
+            button = Action(tabs, group, lambda name=group: self.select_connector_group(name), width=110)
+            button.pack(side="left", padx=(0, 7))
+            self.connector_buttons[group] = button
+        label(tabs, "FMU digital signals use the frequency tests below.", size=8, color=MUTED).pack(side="left", padx=8)
         cards = tk.Frame(section, bg=BG); cards.pack(fill="x", pady=(5, 0))
+        self.connector_groups = {"I2C / ADC": cards}
         self.i2c_cards = {}
         for column, (mode, spec) in enumerate((m, s) for m, s in TESTS.items() if s.get("kind") == "i2c"):
             cards.columnconfigure(column, weight=1, uniform="i2c")
@@ -378,13 +498,77 @@ class Dashboard:
             button.pack(anchor="w")
             button.bind("<Button-1>", lambda _, name=mode: self.station.start_i2c(name))
             self.i2c_cards[mode] = (box, state)
-        cards.columnconfigure(6, weight=1, uniform="i2c")
-        self.adc_box = tk.Frame(cards, bg=PANEL, highlightbackground=BORDER, highlightthickness=1, padx=8, pady=7)
-        self.adc_box.grid(row=0, column=6, sticky="nsew", padx=3)
-        label(self.adc_box, "ADIO · ADC6V6", size=10, bold=True).pack(anchor="w")
-        self.adc_state = label(self.adc_box, "NOT RUN", size=9, color=MUTED); self.adc_state.pack(anchor="w", pady=3)
-        button = label(self.adc_box, "Test ADC →", size=9, color=BLUE, cursor="hand2"); button.pack(anchor="w")
-        button.bind("<Button-1>", lambda _: self.station.start_adc())
+        self.adc_cards = {}
+        adc_rows = [row for row in self.station.profile["channels"] if row.get("method") == "adc_voltage"]
+        for column, row in enumerate(adc_rows, len(self.i2c_cards)):
+            cards.columnconfigure(column, weight=1, uniform="i2c")
+            box = tk.Frame(cards, bg=PANEL, highlightbackground=BORDER, highlightthickness=1, padx=8, pady=7)
+            box.grid(row=0, column=column, sticky="nsew", padx=3)
+            label(box, "ADIO · ADC" + row["id"].removeprefix("ADIO_ADC_"), size=10, bold=True).pack(anchor="w")
+            state = label(box, "NOT RUN", size=9, color=MUTED); state.pack(anchor="w", pady=3)
+            button = label(box, "Test ADC →", size=9, color=BLUE, cursor="hand2"); button.pack(anchor="w")
+            button.bind("<Button-1>", lambda _, channel=row["id"]: self.station.start_adc(channel))
+            self.adc_cards[row["id"]] = (box, state)
+
+        can = tk.Frame(section, bg=BG)
+        self.connector_groups["CAN"] = can
+        label(can, "CAN1 ↔ CAN2 · physical communication test", size=12, bold=True).pack(anchor="w", pady=(8, 4))
+        label(can, TESTS["CAN"]["wiring"], size=9, color=MUTED, wraplength=900, justify="left").pack(anchor="w")
+        self.can_state = label(can, "NOT RUN", size=9, color=MUTED)
+        self.can_state.pack(anchor="w", pady=5)
+        Action(can, "Test CAN", self.station.start_can, width=120).pack(anchor="w")
+
+        io = tk.Frame(section, bg=BG)
+        self.connector_groups["IOV2 PWM"] = io
+        header = tk.Frame(io, bg=BG); header.pack(fill="x", pady=(5, 3))
+        label(header, "After FMU stops: move the P21 harness to IOV2 PWM1–8. Signal pins and GND only.", size=9, color=AMBER).pack(side="left")
+        Action(header, "Confirm IOV2 wiring", self.station.start_iov2, width=165).pack(side="right")
+        outputs = tk.Frame(io, bg=BG); outputs.pack(fill="x")
+        self.iov2_cards = {}
+        for column, (mode, spec) in enumerate((m, s) for m, s in TESTS.items() if s.get("kind") == "io_pwm"):
+            outputs.columnconfigure(column, weight=1, uniform="iov2")
+            box = tk.Frame(outputs, bg=PANEL, highlightbackground=BORDER, highlightthickness=1, padx=8, pady=5)
+            box.grid(row=0, column=column, sticky="nsew", padx=3)
+            title = label(box, f"PWM{spec['channel']} · IO {spec['source_io_pin']}", size=9, bold=True); title.pack(anchor="w")
+            pin = label(box, f"P21.{spec['probe_connector_pin']} · {spec['probe_pin']}", size=8, color=MUTED); pin.pack(anchor="w")
+            state = label(box, "NOT RUN", size=9, color=MUTED); state.pack(anchor="w", pady=3)
+            frequency = label(box, f"Target {spec['expected_hz']} Hz", size=8, color=MUTED); frequency.pack(anchor="w")
+            retest = label(box, "Retest →", size=8, color=BLUE, cursor="hand2"); retest.pack(anchor="w", pady=(3, 0))
+            retest.bind("<Button-1>", lambda _, key=mode: self.station.start_iov2(key))
+            for widget in (box, title, pin, state, frequency):
+                widget.configure(cursor="hand2")
+                widget.bind("<Button-1>", lambda _, key=mode: self.select_iov2(key))
+            self.iov2_cards[mode] = (box, state, frequency)
+
+        sbus = tk.Frame(io, bg=PANEL, highlightbackground=BORDER, highlightthickness=1, padx=10, pady=7)
+        sbus.pack(fill="x", pady=(7, 0))
+        title = label(sbus, "SBUS OUT · IO PB10 → P8.2 / PG5", size=10, bold=True)
+        title.pack(side="left")
+        state = label(sbus, "NOT RUN", size=9, color=MUTED); state.pack(side="left", padx=14)
+        frequency = label(sbus, "100 kbaud · 8E2 · 25 bytes", size=9, color=MUTED); frequency.pack(side="left")
+        Action(sbus, "Test SBUS OUT", self.station.start_sbus_out, width=128).pack(side="right")
+        for widget in (sbus, title, state, frequency):
+            widget.configure(cursor="hand2")
+            widget.bind("<Button-1>", lambda _: self.select_iov2("SBUS_OUT"))
+        self.iov2_cards["SBUS_OUT"] = (sbus, state, frequency)
+
+        network = tk.Frame(section, bg=PANEL, padx=12, pady=8, highlightbackground=BORDER, highlightthickness=1)
+        self.connector_groups["Ethernet"] = network
+        heading = tk.Frame(network, bg=PANEL); heading.pack(fill="x")
+        label(heading, "PIXNOVA ↔ PC · ETHERNET", size=10, bold=True).pack(side="left")
+        Action(heading, "Test Ethernet", self.station.start_ethernet, width=126).pack(side="right")
+        from network_ui import NetworkPanel
+        self.network_panel = NetworkPanel(network, demo=self.station.demo, can_change=self.station.network_idle)
+        self.network_panel.pack(fill="x", pady=7)
+        self.ethernet_state = label(network, "NOT RUN · connect the PixNova Ethernet adapter to the isolated PC interface", size=9, color=MUTED)
+        self.ethernet_state.pack(anchor="w", pady=4)
+        label(network, "PC 192.168.77.1/24 ↔ PixNova 192.168.77.2 · Physical link + bidirectional token/CRC-checked UDP · USB stays connected", size=8, color=MUTED).pack(anchor="w")
+
+    def select_connector_group(self, group):
+        self.connector_groups[self.connector_group].pack_forget()
+        self.connector_group = group
+        self.connector_groups[group].pack(fill="x", pady=(5, 0))
+        self.render()
 
     def _inspector(self, parent):
         canvas = tk.Canvas(parent, bg=PANEL, highlightthickness=0)
@@ -484,6 +668,7 @@ class Dashboard:
         self.render()
 
     def select_sensor(self, name):
+        self.selected_iov2 = None
         self.selected_sensor = name
         group = "Storage" if name in STORAGE else "Sensors"
         if self.peripheral_group != group:
@@ -494,31 +679,35 @@ class Dashboard:
     def _render_peripherals(self):
         model = self.station.peripherals
         online = "source" in self.station.hello
+        recorded = bool(getattr(self.station, "completed_report", None))
+        available = online or recorded
         passed = sum(row["status"] == "PASS" for row in model.latest.values())
         failed = any(row["status"] == "FAIL" for row in model.latest.values())
         boot_failed = "source" in model.summaries and not model.passed(("source",))
         text = f"POWER-ON {'PASS' if model.passed(('source',)) else 'FAIL' if boot_failed else 'PENDING'} · {passed}/{len(DEVICES)} latest PASS" if online else "Connect PixNova USB to read power-on checks"
-        self.peripheral_summary.configure(text=text, fg=MUTED if not online else RED if failed or boot_failed else GREEN if passed == len(DEVICES) else AMBER)
+        if recorded:
+            text = f"COMPLETED SELF-CHECK · {passed}/{len(DEVICES)} PASS" + (" · source USB offline" if not online else "")
+        self.peripheral_summary.configure(text=text, fg=MUTED if not available else RED if failed or boot_failed else GREEN if passed == len(DEVICES) else AMBER)
         for group, devices in (("Sensors", SENSORS), ("Storage", STORAGE)):
-            good = sum(model.latest[name]["status"] == "PASS" for name in devices) if online else 0
-            bad = online and any(model.latest[name]["status"] == "FAIL" for name in devices)
+            good = sum(model.latest[name]["status"] == "PASS" for name in devices) if available else 0
+            bad = available and any(model.latest[name]["status"] == "FAIL" for name in devices)
             button = self.peripheral_buttons[group]
             button.text = f"{group} {good}/{len(devices)}"
-            button.fg = MUTED if not online else RED if bad else GREEN if good == len(devices) else AMBER
+            button.fg = MUTED if not available else RED if bad else GREEN if good == len(devices) else AMBER
             button.fill = "#1d3b5c" if self.peripheral_group == group else "#1a2a41"
             button.paint()
         for name, widgets in self.sensor_cards.items():
             result = model.latest[name]
-            status = result["status"] if online else "WAITING"
+            status = result["status"] if available else "WAITING"
             color, fill = STATE_COLORS[status]
-            bg = fill if online and status in ("PASS", "FAIL") else PANEL
+            bg = fill if available and status in ("PASS", "FAIL") else PANEL
             widgets["frame"].configure(bg=bg, highlightbackground=color if status == "FAIL" else BLUE if self.selected_sensor == name else BORDER)
             for key in ("title", "bus", "state", "history"):
                 widgets[key].configure(bg=bg)
             chip_id = " · " + display_value(DEVICES[name], result.get("detail")) if result.get("detail") is not None else ""
-            widgets["state"].configure(text="● " + (status if online else "OFFLINE") + chip_id, fg=color)
+            widgets["state"].configure(text="● " + (status if available else "OFFLINE") + chip_id, fg=color)
             boot = model.power["source"].get(name, {}).get("status", "—")
-            widgets["history"].configure(text=f"BOOT {boot} · {'PRE-TEST' if result['stage'] == 'PRE-TEST' else 'BOOT'}")
+            widgets["history"].configure(text=f"BOOT {boot} · " + ("SAVED RESULT · USB OFFLINE" if recorded and not online else "PRE-TEST" if result["stage"] == "PRE-TEST" else "BOOT"))
 
     def _log(self, parent):
         heading = tk.Frame(parent, bg=BG)
@@ -536,8 +725,18 @@ class Dashboard:
         self.log.pack(fill="x")
 
     def filter(self, key):
+        self.selected_iov2 = None
         self.faults_only = key == "failed"
         self.filter_group = None if key in (None, "failed") else key
+        if key in ("CAN1", "CAN2", "CAN"):
+            self.select_connector_group("CAN")
+        if key in ("IOV2 PWM", "SBUS OUT"):
+            self.selected_sensor = None
+            self.selected_iov2 = "SBUS_OUT" if key == "SBUS OUT" else "IO_PWM1"
+            self.select_connector_group("IOV2 PWM")
+            self.inspector_scroll.yview_moveto(0)
+        if key == "failed" and any(self.station.i2c_results.get(mode, {}).get("status") == "FAIL" for mode in self.iov2_cards):
+            self.select_connector_group("IOV2 PWM")
         candidates = [i for i, result in enumerate(self.station.assessment.results) if result.status == "FAIL"] if self.faults_only else self.groups.get(key, [])
         if candidates and self.selected not in candidates:
             self.selected = candidates[0]
@@ -545,27 +744,92 @@ class Dashboard:
         self.render()
 
     def select(self, index):
+        self.selected_iov2 = None
         self.selected_sensor = None
         self.selected = index
         self.render()
 
+    def select_iov2(self, mode):
+        self.selected_iov2 = mode
+        self.selected_sensor = None
+        self.inspector_scroll.yview_moveto(0)
+        self.render()
+
+    def _render_iov2_inspector(self):
+        from protocol_model import TESTS
+        mode = self.selected_iov2
+        spec = TESTS[mode]
+        result = self.station.i2c_results.get(mode, {})
+        online = {"source", "probe"}.issubset(self.station.hello)
+        signature = ("iov2", mode, repr(result), online)
+        if signature == self._inspector_signature: return
+        self._inspector_signature = signature
+        status = result.get("status", "NOT RUN")
+        color, fill = STATE_COLORS[status]
+        sbus = mode == "SBUS_OUT"
+        self.inspector_heading.configure(text="SBUS OUT INSPECTOR" if sbus else "IOV2 PWM INSPECTOR")
+        self.inspector_title.configure(text=spec["name"])
+        self.inspector_signal.configure(text=f"IO {spec['source_io_pin']} → {spec['probe_connector']}.{spec['probe_connector_pin']} / {spec['probe_pin']}")
+        self.inspector_badge.configure(text="● " + status + (" · RECORDED" if result and not online else ""), fg=color, bg=fill)
+        for key, title in (("expected", "Expected"), ("measured", "Measured"), ("error", "Decoded frames" if sbus else "Error"), ("window", "Valid windows")):
+            self.detail_labels[key].configure(text=title)
+        expected = spec["expected_hz"]
+        measured = result.get("frequency_hz")
+        self.detail_values["expected"].configure(text="40–55 frames/s" if sbus else f"{expected:.3f} Hz", fg=TEXT)
+        self.detail_values["measured"].configure(text=(f"{measured:.3f} frames/s" if sbus else f"{measured:.3f} Hz") if measured is not None else "—", fg=color)
+        self.detail_values["error"].configure(text=str(result.get("probe_rx", 0)) if sbus else f"{(measured - expected) / expected * 100:+.2f}%" if measured is not None else "—", fg=color)
+        self.detail_values["window"].configure(text=f"{result.get('valid_windows', 0)} / 3", fg=color)
+        self.reason.configure(text=result.get("reason", "Confirm the IOV2 harness before enabling a test output."), fg=color)
+        self.pin_note.configure(text=("Receive-only PG5 / P8.2. P8.3 is GND; leave P8.1 disconnected.\n\nValidates inverted 100 kbaud 8E2, complete 25-byte frames and the exact zero-output payload. All eight IOV2 PWM commands remain zero.\n\n" if sbus else "One IOV2 output is active at a time; the other seven must remain quiet.\n\nThe fixture measures the actual waveform. The flight controller verifies applied IO servo values.\n\n") + ("USB offline; showing recorded measurements." if not online else "Use the test button to retest this signal."))
+        self.path.delete("all")
+        for y, caption, value, tag in ((2, "IOV2 SBUS OUT" if sbus else "IOV2 PWM OUTPUT", spec["source_io_pin"], "source"),
+                                        (72, f"PROBE {spec['probe_connector']}.{spec['probe_connector_pin']}", spec["probe_pin"], "probe")):
+            rounded(self.path, 1, y, 215, y + 42, fill=fill, outline=color, tags=(f"inspector:{tag}",))
+            self.path.create_text(13, y + 12, text=caption, anchor="w", fill=MUTED, font=(FONT, 8))
+            self.path.create_text(13, y + 29, text=value, anchor="w", fill=color, font=(MONO, 14, "bold"))
+        self.path.create_line(108, 46, 108, 68, fill=color, width=2, arrow="last")
+
     def render(self):
+        self.export_action.set_enabled(self.station.network_idle() and not self.station.network_busy())
         results = self.station.assessment.results
         passed = sum(result.status == "PASS" for result in results)
         failed = sum(result.status == "FAIL" for result in results)
-        for key, value in [("total", len(results)), ("pass", passed), ("fail", failed), ("pending", len(results) - passed - failed)]:
+        io_results = [self.station.i2c_results.get(mode, {}).get("status", "NOT RUN") for mode in self.iov2_cards]
+        io_failed = io_results.count("FAIL")
+        total = len(results) + len(io_results)
+        passed += io_results.count("PASS")
+        failed += io_failed
+        for key, value in [("total", total), ("pass", passed), ("fail", failed), ("pending", total - passed - failed)]:
             self.metric_labels[key].configure(text=str(value).zfill(2))
         for key, (frame, title, count) in self.nav_items.items():
             selected = key == "failed" if self.faults_only else key == self.filter_group
             bg = "#1b2e49" if selected else SIDEBAR
+            if key == "SBUS OUT":
+                status = self.station.i2c_results.get("SBUS_OUT", {}).get("status", "NOT RUN")
+                color = GREEN if status == "PASS" else RED if status == "FAIL" else MUTED
+                count.configure(text=status if status in ("PASS", "FAIL") else "0/1", fg=color, bg=bg)
+                title.configure(fg=color if status in ("PASS", "FAIL") else TEXT if selected else MUTED, bg=bg)
+                frame.configure(bg=bg)
+                continue
+            if key == "IOV2 PWM":
+                states = [self.station.i2c_results.get(f"IO_PWM{i}", {}).get("status", "NOT RUN") for i in range(1, 9)]
+                passed_io, failed_io = states.count("PASS"), states.count("FAIL")
+                color = RED if failed_io else GREEN if passed_io == 8 else MUTED
+                count.configure(text=f"{failed_io} FAIL" if failed_io else f"{passed_io}/8", fg=color, bg=bg)
+                title.configure(fg=color if failed_io or passed_io == 8 else TEXT if selected else MUTED, bg=bg)
+                frame.configure(bg=bg)
+                continue
             indices = self.groups.get(key, range(len(results)))
             bad = sum(results[i].status == "FAIL" for i in indices)
-            count.configure(text=f"{bad}/{len(indices)}" if bad and key != "failed" else str(bad if key == "failed" else len(indices)),
+            signal_count = len(indices) + (len(io_results) if key is None else 0)
+            if key is None: bad += io_failed
+            if key == "failed": bad += io_failed
+            count.configure(text=f"{bad}/{signal_count}" if bad and key != "failed" else str(bad if key == "failed" else signal_count),
                             fg=RED if bad else MUTED, bg=bg)
             title.configure(fg=RED if bad and key is not None else TEXT if selected else MUTED, bg=bg)
             frame.configure(bg=bg)
         group_title = "Failed pins" if self.faults_only else self.filter_group or "All ports"
-        self.map_title.configure(text=f"{group_title} · " + ("Frequency / ADC voltage" if self.filter_group in (None, "AD&IO") else "GPIO frequency"))
+        self.map_title.configure(text=f"{group_title} · " + ("SBUS frames" if self.filter_group == "SBUS OUT" else "IO PWM frequency" if self.filter_group == "IOV2 PWM" else "Frequency / ADC voltage" if self.filter_group in (None, "AD&IO") else "GPIO frequency"))
         for role in ("source", "probe"):
             online = role in self.station.hello
             status = "Demo" if self.station.demo else "Verified" if online else "Offline"
@@ -576,15 +840,39 @@ class Dashboard:
             color = GREEN if status == "PASS" else RED if status == "FAIL" else BLUE if status in ("WAITING", "VERIFYING") else MUTED
             state.configure(text=status, fg=color)
             box.configure(highlightbackground=color)
-        adc = self.station.adc_summary()
-        color = STATE_COLORS[adc["status"]][0]
-        self.adc_state.configure(text=adc["status"], fg=color)
-        self.adc_box.configure(highlightbackground=color)
+        for channel, (box, state) in self.adc_cards.items():
+            adc = self.station.adc_summary(channel)
+            color = STATE_COLORS[adc["status"]][0]
+            state.configure(text=adc["status"], fg=color)
+            box.configure(highlightbackground=color)
+        for mode, (box, state, frequency) in self.iov2_cards.items():
+            result = self.station.i2c_results.get(mode, {})
+            status = result.get("status", "NOT RUN")
+            color = STATE_COLORS[status][0]
+            state.configure(text=status, fg=color)
+            box.configure(highlightbackground=color)
+            measured = result.get("frequency_hz")
+            text = (f"{measured:.2f} frames/s · RX {result.get('probe_rx', 0)}" if mode == "SBUS_OUT" else f"{measured:.2f} Hz") if measured is not None else "Waiting for SBUS frames" if mode == "SBUS_OUT" else "Awaiting frequency"
+            frequency.configure(text=text, fg=color)
+        ethernet = self.station.i2c_results.get("ETH", {})
+        eth_status = ethernet.get("status", "NOT RUN")
+        self.ethernet_state.configure(text=f"{eth_status} · FC TX/RX {ethernet.get('source_tx', 0)}/{ethernet.get('source_rx', 0)} · PC verified {ethernet.get('host_rx', 0)} · {ethernet.get('reason', 'Waiting for Ethernet test')}", fg=STATE_COLORS[eth_status][0])
+        can = self.station.i2c_results.get("CAN", {})
+        can_status = can.get("status", "NOT RUN")
+        self.can_state.configure(text=f"{can_status} · TX/RX {can.get('source_tx', 0)}/{can.get('source_rx', 0)} · {can.get('reason', 'Waiting for CAN test')}", fg=STATE_COLORS[can_status][0])
+        for group, modes in (("I2C / ADC", tuple(self.i2c_cards) + ("ADC3V3_LOW", "ADC3V3_HIGH", "ADC6V6_LOW", "ADC6V6_HIGH")), ("CAN", ("CAN",)), ("IOV2 PWM", tuple(self.iov2_cards)), ("Ethernet", ("ETH",))):
+            states = [self.station.i2c_results.get(mode, {}).get("status", "NOT RUN") for mode in modes]
+            button = self.connector_buttons[group]
+            button.fg = RED if "FAIL" in states else GREEN if all(status == "PASS" for status in states) else TEXT if group == self.connector_group else MUTED
+            button.paint()
         self.map.render()
         self._render_peripherals()
         self._render_inspector()
 
     def _render_inspector(self):
+        if getattr(self, "selected_iov2", None) is not None:
+            self._render_iov2_inspector()
+            return
         if self.selected_sensor is not None:
             self._render_sensor_inspector()
             return
@@ -612,12 +900,14 @@ class Dashboard:
         self.pin_note.configure(text=("Signal path failed. Check the source, wiring and probe.\n\n" if result.status == "FAIL" else "") + row["note"])
         adc = row.get("method") == "adc_voltage"
         if adc:
+            from protocol_model import TESTS
+            high_spec = next(spec for spec in TESTS.values() if spec.get("channel") == row["id"] and spec["stimulus_mv"] == 3300)
             self.inspector_heading.configure(text="ADC VOLTAGE TEST")
             for key, text in (("expected", "Low target"), ("measured", "Low readback"), ("error", "High target"), ("window", "High readback")):
                 self.detail_labels[key].configure(text=text)
             self.detail_values["expected"].configure(text="0.000 V")
             self.detail_values["measured"].configure(text=f"{result.voltage_low_mv / 1000:.3f} V" if result.voltage_low_mv is not None else "—", fg=color)
-            self.detail_values["error"].configure(text="1.650 V", fg=TEXT)
+            self.detail_values["error"].configure(text=f"{high_spec['expected_mv'] / 1000:.3f} V", fg=TEXT)
             self.detail_values["window"].configure(text=f"{result.voltage_high_mv / 1000:.3f} V" if result.voltage_high_mv is not None else "—", fg=color)
         canvas = self.path
         canvas.delete("all")
@@ -625,8 +915,8 @@ class Dashboard:
         path_rows = [(2, "PIXNOVA / FMU", row["source_pin"], "source"),
                      (72, f"PROBE {row['probe_connector']} · PIN {row['probe_connector_pin']}", row["probe_pin"], "probe")]
         if adc:
-            path_rows = [(2, "PROBE P10.7 · 0 / 3.3 V", row["probe_pin"], "probe"),
-                         (72, "PIXNOVA ADC1 · INPUT 12", "PC2_C", "source")]
+            path_rows = [(2, f"PROBE {row['probe_connector']}.{row['probe_connector_pin']} · 0 / 3.3 V", row["probe_pin"], "probe"),
+                         (72, f"PIXNOVA ADC1 · INPUT {high_spec['adc_channel']}", high_spec["adc_pin"], "source")]
         for y, caption, value, tag in path_rows:
             rounded(canvas, 1, y, width - 1, y + 42, fill=fill, outline=color, tags=(f"inspector:{tag}",))
             canvas.create_text(13, y + 12, text=caption, anchor="w", fill=MUTED, font=(FONT, 8))

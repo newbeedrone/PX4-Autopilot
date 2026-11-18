@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import queue
-import socket
 import tempfile
 import time
 import tkinter as tk
@@ -18,6 +17,7 @@ from generate_profile import load_profile
 from peripherals import DEVICES, Peripherals
 from protocol_model import TESTS, ProtocolRun, packet, rc_values
 from transport import SerialEndpoint
+from ethernet import EthernetPeer
 
 
 class ProtocolStation:
@@ -35,9 +35,7 @@ class ProtocolStation:
         self.frames = []
         self.generation = 0
         self.udp = None
-        self.pending_udp = {}
-        self.udp_sequence = 0
-        self.last_udp = self.last_demo = 0
+        self.last_demo = 0
         self.last_pump = time.monotonic()
         self.closed = False
         self.mode = tk.StringVar(value="I2C3")
@@ -46,9 +44,9 @@ class ProtocolStation:
         self.status = tk.StringVar(value="Connect USB; all protocol outputs remain disabled")
         self._build()
         root.protocol("WM_DELETE_WINDOW", self.close)
-        root.after(50, self.pump)
+        self.pump_after_id = root.after(50, self.pump)
         if demo:
-            root.after(150, self.connect)
+            root.after(150, lambda: self.connect() if not self.closed and not self.hello and self.run is None else None)
 
     def _build(self):
         self.root.title("PixNova · Connector Protocol Tests" + (" · DEMO" if self.demo else ""))
@@ -71,6 +69,10 @@ class ProtocolStation:
         Action(connection, "Connect USB", self.connect, 120).grid(row=1, column=3, padx=5)
         self.identity = label(connection, "", color=MUTED, size=9)
         self.identity.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        from network_ui import NetworkPanel
+        self.network_panel = NetworkPanel(outer, demo=self.demo,
+                                         can_change=lambda: self.run is None or self.run.phase in ("COMPLETE", "FAILED", "STOPPED"))
+        self.network_panel.pack(fill="x", pady=(8, 0))
         sensor_frame = tk.Frame(outer, bg=BG); sensor_frame.pack(fill="x", pady=14)
         self.sensor_labels = {}
         for index, (key, spec) in enumerate(DEVICES.items()):
@@ -110,7 +112,8 @@ class ProtocolStation:
                        bg=PANEL, fg=TEXT, selectcolor=BG, activebackground=PANEL, activeforeground=TEXT, justify="left").pack(anchor="w", pady=12)
         Action(side, "Start selected test", self.start, 200, primary=True).pack(anchor="w", pady=5)
         Action(side, "Stop outputs", self.stop, 200, danger=True).pack(anchor="w", pady=5)
-        Action(side, "Export JSON", self.export, 200).pack(anchor="w", pady=5)
+        self.export_action = Action(side, "Export JSON", self.export, 200)
+        self.export_action.pack(anchor="w", pady=5)
         label(side, "CAN / ETH are real communication tests.\nNo ADC waveform-only pass is reported.", color=MUTED, size=9, wraplength=340, justify="left").pack(anchor="w", pady=12)
         label(outer, variable=self.status, color=BLUE, wraplength=1270, justify="left").pack(anchor="w", pady=(15, 0))
         self.select("I2C3")
@@ -121,6 +124,7 @@ class ProtocolStation:
         wheel_bind(row)
 
     def select(self, mode):
+        self.network_panel.cancel_test()
         self.mode.set(mode); self.wired.set(False)
         spec = TESTS[mode]
         self.selected.configure(text=spec["name"])
@@ -143,11 +147,22 @@ class ProtocolStation:
 
     def open_io_ports(self):
         if self.closed: return
+        if self.network_panel.changing:
+            self.status.set("Wait for the Ethernet adapter operation before switching windows"); return
+        if self.run and self.run.phase not in ("COMPLETE", "FAILED", "STOPPED"):
+            self.stop("Switching to IO port tests")
+            self.root.after(100, self.open_io_ports)
+            return
+        if self.run and not self.run.outputs_stopped:
+            self.status.set("STOP unconfirmed; reconnect USB before switching tests")
+            return
         source, probe = self.source_port.get(), self.probe_port.get()
         self.stop("Switching to IO port tests")
         self.close_links()
         self.generation += 1
         self.closed = True
+        self.root.after_cancel(self.pump_after_id)
+        self.network_panel.close()
         if self.on_io_ports is not None:
             self.root.destroy()
             self.on_io_ports()
@@ -162,6 +177,9 @@ class ProtocolStation:
 
     def connect(self):
         if self.closed: return
+        if self.run and self.run.phase not in ("COMPLETE", "FAILED", "STOPPED"):
+            self.stop("Stopping before reconnecting; wait for confirmation")
+            return
         self.stop()
         self.close_links()
         self.generation += 1
@@ -170,7 +188,7 @@ class ProtocolStation:
         self.render()
         if self.demo:
             for role, device in (("source", "0000000000000001"), ("probe", "0000000000000002")):
-                self.hello[role] = {"role": role, "device_id": device, "firmware": "0" * 16, "protocol_tests": 1}
+                self.hello[role] = {"role": role, "device_id": device, "firmware": "0" * 16, "protocol_tests": 1, "io_pwm": 1, "session_stop": 1}
             self.power.power["source"] = {key: {"pass": True, "detail": spec.get("demo", spec["id"])} for key, spec in DEVICES.items()}
             self.power.summaries["source"] = {"pass": True}
             self.probe_ready = True
@@ -199,46 +217,63 @@ class ProtocolStation:
                 emit({"type": "started", "session": session, "mode": self.run.mode, "role": role})
             elif command.startswith("PING "):
                 emit({"type": "heartbeat", "session": session, "running": True})
+            elif command == "STOP" or command.startswith("STOP "):
+                emit({"type": "stopped", "session": command.split()[1] if command.startswith("STOP ") else session, "reason": "requested"})
             return
         if role in self.links:
             self.links[role].send(command)
 
-    def start(self):
+    def start(self, interface_index=None):
+        if self.network_panel.changing:
+            self.status.set("Wait for the Ethernet adapter operation before testing"); return
         if self.run and self.run.phase not in ("COMPLETE", "FAILED", "STOPPED"):
             self.status.set("Stop the active protocol before selecting another"); return
+        if self.run and not self.run.outputs_stopped:
+            self.status.set("STOP unconfirmed; reconnect USB before testing"); return
         mode = self.mode.get(); roles = {"source"} if mode in ("CAN", "ETH") else {"source", "probe"}
         if not self.demo and TESTS[mode].get("kind") == "i2c" and not all(self.hello.get(role, {}).get("i2c_simulators") == 2 for role in roles):
             self.status.set("Update both boards with the final I2C slave firmware"); return
-        if not self.demo and TESTS[mode].get("kind") == "adc" and not all(self.hello.get(role, {}).get("adc_levels") == 1 for role in roles):
+        if not self.demo and TESTS[mode].get("kind") == "adc" and not all(self.hello.get(role, {}).get("adc_levels") == 2 for role in roles):
             self.status.set("Update both boards with the ADC voltage firmware"); return
+        if not self.demo and TESTS[mode].get("kind") == "io_pwm" and not all(self.hello.get(role, {}).get("io_pwm") == 1 and self.hello[role].get("session_stop") == 1 for role in roles):
+            self.status.set("Update both boards with the IOV2 PWM/session STOP firmware"); return
+        if not self.demo and mode == "SBUS_OUT" and not all(self.hello.get(role, {}).get("sbus_out") == 1 and self.hello[role].get("session_stop") == 1 for role in roles):
+            self.status.set("Update both boards with the SBUS OUT / PG5 test firmware"); return
         if not self.demo and not self.wired.get():
             self.status.set("Install and confirm the selected wiring before starting"); return
         if not roles.issubset(self.hello) or not self.power.complete(("source",)) or ("probe" in roles and not self.probe_ready):
             self.status.set("Complete USB identity/diagnostic transfer and verify the simulator; onboard failures are independent"); return
+        if mode == "ETH" and not self.demo and interface_index is None:
+            generation = self.generation
+            self.network_panel.prepare(lambda index: self.start(index) if not self.closed and generation == self.generation and self.mode.get() == mode else None)
+            return
         try:
             self.udp_close()
-            self.run = ProtocolRun(mode, self.digest, time.monotonic(), self.send)
-            self.current_devices.clear()
+            self.run = None
             if mode == "ETH" and not self.demo:
-                self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                self.udp.bind(("192.168.77.1", 0)); self.udp.setblocking(False)
-            self.pending_udp.clear(); self.udp_sequence = 0
+                self.udp = EthernetPeer(interface_index)
+            self.run = ProtocolRun(mode, self.digest, time.monotonic(), self.send,
+                                   session_stop=all(self.hello[role].get("session_stop") == 1 for role in roles))
+            self.current_devices.clear()
             self.run.begin()
+            self.results[mode] = self.run.snapshot()
         except (OSError, RuntimeError, ValueError) as error:
             if self.run: self.run.fail(str(error)); self.results[mode] = self.run.snapshot()
+            else: self.results[mode] = {"status": "NOT RUN", "reason": str(error)}
             self.udp_close(); self.status.set(str(error)); self.render(); return
         self.render()
 
     def stop(self, reason="Stopped by operator"):
+        self.network_panel.cancel_test()
         if self.run and self.run.phase not in ("COMPLETE", "FAILED", "STOPPED"):
-            try: self.run.stop(reason)
-            except RuntimeError: pass
+            self.run.stop(reason, now=time.monotonic())
             self.results[self.run.mode] = self.run.snapshot()
-        for role in self.links:
-            try: self.send(role, "STOP")
-            except RuntimeError: pass
+        elif not self.run:
+            for role in self.links:
+                try: self.send(role, "STOP")
+                except RuntimeError: pass
         self.udp_close()
-        self.status.set(reason + " · outputs stopped")
+        self.status.set(self.run.result.reason if self.run else reason + " · STOP requested")
 
     def udp_close(self):
         if self.udp is not None:
@@ -288,27 +323,8 @@ class ProtocolStation:
         if self.run: self.run.handle(role, frame, now)
 
     def udp_pump(self, now):
-        if not self.udp or not self.run or self.run.phase != "RUNNING": return
-        if self.run.samples.get("source", {}).get("detail") != 1:
-            if self.run.host_rx:
-                self.run.fail("Ethernet physical link lost")
-            return
-        if self.pending_udp and now - min(self.pending_udp.values()) > 1:
-            self.run.fail("Ethernet reply timed out"); return
-        for _ in range(32):
-            try: data, peer = self.udp.recvfrom(128)
-            except BlockingIOError: break
-            if peer != ("192.168.77.2", 14570) or len(data) != 32:
-                self.run.fail("Unexpected Ethernet peer or packet length"); return
-            sequence = int.from_bytes(data[8:12], "little")
-            if sequence not in self.pending_udp:
-                self.run.fail("Unsolicited/replayed Ethernet response"); return
-            del self.pending_udp[sequence]
-            self.run.accept_udp(data, sequence, now)
-        if now - self.last_udp >= .05:
-            self.udp_sequence += 1
-            self.udp.sendto(packet("ETH", self.run.token, self.udp_sequence), ("192.168.77.2", 14570))
-            self.pending_udp[self.udp_sequence] = now; self.last_udp = now
+        if self.udp is not None and self.run is not None:
+            self.udp.pump(self.run, now)
 
     def pump(self):
         if self.closed: return
@@ -329,7 +345,7 @@ class ProtocolStation:
                     old = self.run.samples.get(role, {})
                     self.run.handle(role, {"type": "protocol_sample", "session": self.run.session, "mode": self.run.mode,
                                           "seq": old.get("seq", 0) + 1, "tx": old.get("tx", 0) + 20, "rx": old.get("rx", 0) + 20,
-                                          "errors": 0, "pass": self.run.phase != "RC_LOSS", "detail": (TESTS[self.run.mode]["stimulus_mv"] if role == "probe" else (0 if self.run.mode == "ADC6V6_LOW" else 1650)) if TESTS[self.run.mode].get("kind") == "adc" else 3 if self.run.mode == "CAN" else 0,
+                                          "errors": 0, "pass": self.run.phase != "RC_LOSS", "detail": TESTS[self.run.mode]["stimulus_mv" if role == "probe" else "expected_mv"] if TESTS[self.run.mode].get("kind") == "adc" else round(TESTS[self.run.mode]["expected_hz"] * 1000) if TESTS[self.run.mode].get("kind") in ("io_pwm", "sbus_out") else 3 if self.run.mode == "CAN" else 0,
                                           "channels": rc_values(self.run.token)}, now)
             self.udp_pump(now)
             if self.run:
@@ -344,11 +360,13 @@ class ProtocolStation:
             self.stop(str(error))
             self.close_links(); self.hello.clear(); self.probe_ready = False
             self.generation += 1
-            self.status.set(str(error) + " · outputs stopped")
+            self.status.set(str(error) + " · STOP unconfirmed; USB closed")
         self.last_pump = time.monotonic()
-        self.root.after(50, self.pump)
+        self.pump_after_id = self.root.after(50, self.pump)
 
     def render(self):
+        self.export_action.set_enabled(not (self.run and self.run.phase not in ("COMPLETE", "FAILED", "STOPPED"))
+                                       and not self.network_panel.changing)
         for key, (box, value) in self.sensor_labels.items():
             result = self.current_devices.get(key) or self.power.power["source"].get(key)
             color = GREEN if result and result["pass"] else RED if result else MUTED
@@ -366,9 +384,13 @@ class ProtocolStation:
             detail.configure(text=result.get("reason", "No physical protocol measurement") + "\n" + counters)
 
     def export(self):
+        if (self.run and self.run.phase not in ("COMPLETE", "FAILED", "STOPPED")) or self.network_panel.changing:
+            self.status.set("Stop the active test and wait for output shutdown before exporting")
+            return
         report = {"utc": datetime.now(timezone.utc).isoformat(), "demo": self.demo, "profile_sha256": self.digest,
                   "devices": deepcopy(self.hello), "power_on": self.power.snapshot(), "probe_power_on": deepcopy(self.probe_checks),
                   "latest_device_checks": deepcopy(self.current_devices),
+                  "pc_ethernet": self.network_panel.snapshot(),
                   "protocols": deepcopy(self.results), "frames": deepcopy(self.frames),
                   "all_protocols_completed": set(self.results) == set(TESTS) and all(r["status"] == "PASS" for r in self.results.values())}
         report["hardware_protocols_passed"] = not self.demo and report["all_protocols_completed"]
@@ -387,7 +409,13 @@ class ProtocolStation:
             if temporary: temporary.unlink(missing_ok=True)
 
     def close(self):
-        self.closed = True; self.stop(); self.close_links(); self.root.destroy()
+        if self.closed: return
+        if self.run and self.run.phase not in ("COMPLETE", "FAILED", "STOPPED"):
+            self.stop("Closing protocol station")
+            self.root.after(100, self.close)
+            return
+        self.closed = True; self.stop(); self.root.after_cancel(self.pump_after_id)
+        self.network_panel.close(); self.close_links(); self.root.destroy()
 
 
 def main():

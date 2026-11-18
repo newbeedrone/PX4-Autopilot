@@ -19,6 +19,36 @@ def check_pass():
     try:
         assert station.assessment.all_passed
         assert station.peripherals.passed()
+        completed = station.report_snapshot()
+        completed.update(run_state="COMPLETE", test_suite_completed=True, external_suite_passed=True, all_passed=True)
+        station.completed_report = completed
+        station.suite_completed = True
+        station.phase = "COMPLETE"
+        station.show_completion()
+        station.handle("source", {"type": "disconnected"})
+        station.draw_results(); root.update_idletasks()
+        assert station.phase == "COMPLETE" and station.state.get().startswith("TEST COMPLETE")
+        assert station.view.metric_labels["pass"].cget("text") == "43"
+        assert "source USB offline" in station.view.peripheral_summary.cget("text")
+        assert station.view.sensor_cards["icm45686_spi1"]["state"].cget("fg") == GREEN
+        station.completed_report = None
+        station.suite_completed = False
+        station.hello["source"] = True
+        station.phase = "RUNNING"
+        assert set(station.view.adc_cards) == {"ADIO_ADC_3V3", "ADIO_ADC_6V6"}
+        station.view.filter("AD&IO")
+        adc3 = next(i for i, row in enumerate(station.profile["channels"]) if row["id"] == "ADIO_ADC_3V3")
+        station.view.select(adc3)
+        root.update_idletasks()
+        assert station.view.inspector_heading.cget("text") == "ADC VOLTAGE TEST"
+        assert station.view.detail_values["error"].cget("text") == "3.300 V"
+        assert station.view.detail_values["window"].cget("text") == "3.300 V"
+        station.i2c_results["ADC3V3_HIGH"]["status"] = "FAIL"
+        station._sync_adc_result(); station.draw_results()
+        assert station.view.adc_cards["ADIO_ADC_3V3"][1].cget("fg") == RED
+        assert station.view.adc_cards["ADIO_ADC_6V6"][1].cget("fg") == GREEN
+        station.i2c_results["ADC3V3_HIGH"]["status"] = "PASS"
+        station._sync_adc_result(); station.view.filter(None); station.view.select(0)
         for name in ("icm45686_spi1", "icm45686_spi2", "icm45686_spi3"):
             assert station.view.sensor_cards[name]["state"].cget("fg") == GREEN
         station.view.select_peripheral_group("Storage")
@@ -27,6 +57,12 @@ def check_pass():
             assert station.view.sensor_cards[name]["state"].cget("fg") == GREEN
         station.view.select_peripheral_group("Sensors")
         assert station.view.map.itemcget("pin-fill:0", "outline") == GREEN
+        station.view.filter("SPI6")
+        reserved = station.view.map.find_withtag("protected:P9:7")
+        assert len(reserved) == 2
+        assert any("SPIX_SYNC / PE9" in station.view.map.itemcget(item, "text") for item in reserved)
+        assert any("NOT TESTED" in station.view.map.itemcget(item, "text") for item in reserved)
+        station.view.filter(None)
         root.geometry("1180x760")
         root.update_idletasks()
         # Click the actual drawn connector pin, rather than calling the controller.
@@ -84,7 +120,7 @@ def check_fault():
         assert station.view.peripheral_buttons["Storage"].fg == RED
         assert station.view.sensor_cards["icm45686_spi1"]["state"].cget("fg") == GREEN
         assert all(row.status == "NOT RUN" for row in station.assessment.results)
-        print("GUI: pin faults, three IMUs, storage, full multi-device failure results and power-on blocking passed", flush=True)
+        print("GUI: completion retained after disconnect, independent ADC cards, pin faults, sensors and storage passed", flush=True)
     except Exception as error:
         failures.append(error)
     finally:

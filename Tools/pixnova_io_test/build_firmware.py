@@ -114,9 +114,25 @@ def validate_protocol_config(config, role):
             if forbidden in config.splitlines():
                 raise ValueError("Unsafe protocol test configuration: " + forbidden)
     else:
-        for forbidden in ("CONFIG_STM32H7_UART8=y", "CONFIG_STM32H7_ETHMAC=y"):
+        for required in ("CONFIG_ARCH_RAMVECTORS=y", "CONFIG_ARCH_HIPRI_INTERRUPT=y", "CONFIG_ARCH_IRQPRIO=y",
+                         "CONFIG_BOARD_EARLY_INITIALIZE=y", "CONFIG_STM32H7_DTCMEXCLUDE=y", "CONFIG_STM32H7_RTC_LSICLOCK=y"):
+            if required not in config.splitlines():
+                raise ValueError("SBUS fast capture requires: " + required)
+        for forbidden in ("CONFIG_STM32H7_UART8=y", "CONFIG_STM32H7_ETHMAC=y", "CONFIG_STM32H7_RTC_LSECLOCK=y"):
             if forbidden in config.splitlines():
                 raise ValueError("Simulator signals must remain undriven until a checked command: " + forbidden)
+
+
+def validate_probe_vectors(elf):
+    symbols = subprocess.check_output(["arm-none-eabi-nm", "-n", "-S", str(elf)], text=True)
+    for line in symbols.splitlines():
+        fields = line.split()
+        if len(fields) == 4 and fields[3] == "g_ram_vectors":
+            address, size = int(fields[0], 16), int(fields[1], 16)
+            if address % 1024 == 0 and size >= 64 and 0x20000000 <= address < address + size <= 0x20010000:
+                return address
+            break
+    raise ValueError("SBUS RAM vectors must be 1024-byte aligned in uncached DTCM1, outside AXI SRAM")
 
 
 def build(role, artifact_dir, stamp, digest, revision, protocols=False):
@@ -150,9 +166,13 @@ def build(role, artifact_dir, stamp, digest, revision, protocols=False):
         raise ValueError("Protocol endpoint capability missing from firmware")
     if protocols and b'"i2c_simulators":2' not in binary:
         raise ValueError("Final I2C slave capability missing from firmware")
-    if protocols and b'"adc_levels":1' not in binary:
+    if protocols and b'"adc_levels":2' not in binary:
         raise ValueError("ADC voltage test capability missing from firmware")
+    if protocols and any(capability not in binary for capability in (b'"io_pwm":1', b'"session_stop":1', b'"sbus_out":1')):
+        raise ValueError("IOV2 PWM/SBUS OUT/session STOP capability missing from firmware")
     vectors = validate_binary(binary, role, digest)
+    if role == "probe" and protocols:
+        vectors["sbus_ram_vectors"] = validate_probe_vectors(ROOT / "build" / target / (target + ".elf"))
     prototype = json.loads((ROOT / "boards/newbeedrone/pixnova/firmware.prototype").read_text())
     validate_package(json.loads(package.read_text()), binary, prototype["board_id"])
     for extension in ([".px4", ".elf", ".bin"] if role == "source" else [".elf", ".bin"]):

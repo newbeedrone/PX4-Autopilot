@@ -10,6 +10,7 @@
 #undef private
 
 #ifdef CONFIG_GPIO_TEST_PROTOCOLS
+static bool test_protocol_stop_ok = true;
 // Substitute only hardware ownership; exercise the actual USB command gates.
 int ProtocolTest::start(protocol_test::Mode mode, uint32_t)
 {
@@ -19,7 +20,7 @@ int ProtocolTest::start(protocol_test::Mode mode, uint32_t)
 	_feed = test_now;
 	return 0;
 }
-void ProtocolTest::stop() { _mode = protocol_test::Mode::None; }
+bool ProtocolTest::stop() { _mode = protocol_test::Mode::None; return test_protocol_stop_ok; }
 bool ProtocolTest::feed() { return test_now - _feed <= GPIO_TEST_LEASE_US; }
 bool ProtocolTest::update(ProtocolSample &) { return false; }
 #endif
@@ -39,6 +40,9 @@ struct Fixture {
 		test_external_ok = true;
 		test_bad_pin = -1;
 		test_read_cost_us = 0;
+#ifdef CONFIG_GPIO_TEST_PROTOCOLS
+		test_protocol_stop_ok = true;
+#endif
 		test_modes.fill(0);
 		test_levels.fill(false);
 
@@ -95,9 +99,47 @@ struct Fixture {
 
 int main(int argc, char *argv[])
 {
+	{
+		Fixture f;
+		test_reset_count = 0;
+		const char *boot = "BOOTLOADER 00000000000000000000000000000001";
+		assert(f.command("BOOTLOADER 00000000000000000000000000000002", false).find("error") != std::string::npos);
+		assert(test_reset_count == 0);
+		assert(f.command((std::string("BOOTLOADER ") + std::string(100, 'a')).c_str(), false).find("error") != std::string::npos);
+		assert(test_reset_count == 0);
+		f.endpoint._active = true;
+		assert(f.command(boot, false).find("error") != std::string::npos);
+		assert(test_reset_count == 0);
+		f.endpoint._active = false;
+#ifdef CONFIG_GPIO_TEST_PROTOCOLS
+		test_protocol_stop_ok = false;
+		assert(f.command(boot, false).find("error") != std::string::npos);
+		assert(test_reset_count == 0);
+		test_protocol_stop_ok = true;
+#endif
+		const auto response = f.command(boot, false);
+#ifdef CONFIG_GPIO_TEST_RECEIVER
+		assert(response.find("error") != std::string::npos && test_reset_count == 0);
+#else
+		assert(response.find("\"type\":\"bootloader\"") != std::string::npos && test_reset_count == 1);
+#endif
+	}
+
 #ifdef CONFIG_GPIO_TEST_PROTOCOLS
 
 	if (argc > 1 && strcmp(argv[1], "protocol") == 0) {
+		{
+			Fixture f;
+			const std::string stop = std::string("STOP ") + SESSION;
+			const std::string cancelled = f.command(stop.c_str(), false);
+			assert(cancelled.find(SESSION) != std::string::npos);
+			assert(cancelled.find("requested") != std::string::npos);
+			test_protocol_stop_ok = false;
+			const std::string failed = f.command(stop.c_str(), false);
+			assert(failed.find("cleanup_failed") != std::string::npos);
+			assert(failed.find("requested") == std::string::npos);
+		}
+
 		for (bool checked : {false, true}) {
 			Fixture f;
 

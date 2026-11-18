@@ -65,6 +65,8 @@ class StationTests(unittest.TestCase):
             "TELEM1_RX": ("PF6", "PE8", "P15", 4, 10.893),
             "TELEM2_TX": ("PC12", "PD2", "P18", 5, 14.124),
             "TELEM2_RX": ("PD2", "PC12", "P18", 4, 15.384),
+            "TELEM3_TX": ("PD5", "PA3", "P20", 5, 19.920),
+            "TELEM3_RX": ("PA3", "PD5", "P20", 4, 21.739),
             "GPS2_TX": ("PE1", "PE0", "P3", 5, 51.547),
             "GPS2_RX": ("PE0", "PE1", "P3", 4, 56.180),
             "UART4_I2C3_TX": ("PH13", "PH14", "P17", 6, 60.975),
@@ -155,34 +157,40 @@ class StationTests(unittest.TestCase):
                 load_profile(path)
 
     def test_adc_input_cannot_be_changed_into_a_source_waveform(self):
-        profile = copy.deepcopy(self.profile)
-        row = next(r for r in profile["channels"] if r["id"] == "ADIO_ADC_6V6")
-        row.pop("method")
-        row.update(half_period_us=1100, expected_hz=500000/1100)
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "profile.json"; path.write_text(json.dumps(profile))
-            with self.assertRaises(ValueError): load_profile(path)
+        for channel in ("ADIO_ADC_3V3", "ADIO_ADC_6V6"):
+            profile = copy.deepcopy(self.profile)
+            row = next(r for r in profile["channels"] if r["id"] == channel)
+            row.pop("method")
+            profile["protected_source_pins"].pop(row["source_pin"], None)
+            row.update(half_period_us=1100, expected_hz=500000/1100)
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "profile.json"; path.write_text(json.dumps(profile))
+                with self.assertRaises(ValueError): load_profile(path)
 
     def test_gpio_sample_cannot_claim_an_adc_voltage_pass(self):
-        index = next(i for i,r in enumerate(self.profile["channels"]) if r.get("method") == "adc_voltage")
-        self.assertFalse(self.assessment.accept(dict(type="sample", session=self.assessment.session, channel=index,
-                                                   seq=1, frequency_millihz=454545, edges=455, span_us=999000, timing_errors=0)))
-        self.assertNotEqual(self.assessment.results[index].status, "PASS")
+        for index, row in enumerate(self.profile["channels"]):
+            if row.get("method") != "adc_voltage": continue
+            self.assertFalse(self.assessment.accept(dict(type="sample", session=self.assessment.session, channel=index,
+                                                       seq=1, frequency_millihz=454545, edges=455, span_us=999000, timing_errors=0)))
+            self.assertNotEqual(self.assessment.results[index].status, "PASS")
 
     def test_adc_run_updates_the_existing_pin_and_report(self):
         from app import ADC_MODES
         station = self.make_controller()
-        station.capabilities = {role: {"i2c_simulators": 2, "adc_levels": 1} for role in ("source", "probe")}
+        station.capabilities = {role: {"i2c_simulators": 2, "adc_levels": 2} for role in ("source", "probe")}
         station.start_adc()
-        for mode,voltage in zip(ADC_MODES, (4, 1652)):
+        for mode,voltage in zip(ADC_MODES, (4, 1652, 5, 3294)):
             self.assertEqual(station.i2c_run.mode, mode)
             station.i2c_run.result.adc_voltage_mv = voltage
             station.i2c_run.complete("Verified voltage")
-            station._update_i2c()
+            self.confirm_stop(station.i2c_run); station._update_i2c()
         report = station.report_snapshot()
         row = next(r for r in report["channels"] if r["id"] == "ADIO_ADC_6V6")
         self.assertEqual(row["status"], "PASS")
         self.assertEqual((row["voltage_low_mv"], row["voltage_high_mv"]), (4, 1652))
+        row = next(r for r in report["channels"] if r["id"] == "ADIO_ADC_3V3")
+        self.assertEqual(row["status"], "PASS")
+        self.assertEqual((row["voltage_low_mv"], row["voltage_high_mv"]), (5, 3294))
         self.assertTrue(report["adc_passed"])
         self.assertEqual(len(report["channels"]), 43)
         self.assertFalse(any(command.startswith("START ") for _,command in station.commands))
@@ -192,13 +200,49 @@ class StationTests(unittest.TestCase):
         station.phase = "CONNECTING"; station.hello.clear()
         station.handle("probe", dict(type="hello", role="probe", protocol=3, profile=self.digest, channels=43,
                                      device_id="b"*32, firmware="a"*16, independent_external_checks=1,
-                                     protocol_tests=1, i2c_simulators=2, adc_levels=1))
-        self.assertEqual(station.capabilities["probe"]["adc_levels"], 1)
+                                     protocol_tests=1, i2c_simulators=2, adc_levels=2))
+        self.assertEqual(station.capabilities["probe"]["adc_levels"], 2)
+
+    def test_adc_failure_does_not_change_the_other_input_result(self):
+        station = self.make_controller()
+        station.capabilities = {role: {"i2c_simulators": 2, "adc_levels": 2} for role in ("source", "probe")}
+        station.start_adc("ADIO_ADC_3V3")
+        for value in (2, 3290):
+            station.i2c_run.result.adc_voltage_mv = value
+            station.i2c_run.complete("Measured ADC3V3")
+            self.confirm_stop(station.i2c_run); station._update_i2c()
+        self.assertEqual(station.adc_summary("ADIO_ADC_3V3")["status"], "PASS")
+        self.assertEqual(station.adc_summary("ADIO_ADC_6V6")["status"], "NOT RUN")
+        self.assertFalse(station.report_snapshot()["adc_passed"])
+        station.start_adc("ADIO_ADC_6V6")
+        station.i2c_run.fail("Low voltage out of range"); self.confirm_stop(station.i2c_run); station._update_i2c()
+        station.i2c_run.complete("High voltage measured"); self.confirm_stop(station.i2c_run); station._update_i2c()
+        self.assertEqual(station.adc_summary("ADIO_ADC_6V6")["status"], "FAIL")
+        self.assertEqual(station.adc_summary("ADIO_ADC_3V3")["status"], "PASS")
+        self.assertFalse(station.report_snapshot()["adc_passed"])
+
+    def test_legacy_single_adc_firmware_cannot_start_the_new_adc_suite(self):
+        for method in ("start_adc", "start_full_test"):
+            station = self.make_controller()
+            station.capabilities = {role: {"i2c_simulators": 2, "adc_levels": 1} for role in ("source", "probe")}
+            getattr(station, method)()
+            self.assertEqual(station.commands, [])
+
+    def test_adc_voltage_profile_rejects_an_unreviewed_input_mapping(self):
+        for channel in ("ADIO_ADC_3V3", "ADIO_ADC_6V6"):
+            profile = copy.deepcopy(self.profile)
+            next(r for r in profile["channels"] if r["id"] == channel)["probe_pin"] = "PG9"
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "profile.json"; path.write_text(json.dumps(profile))
+                with self.assertRaises(ValueError): load_profile(path)
 
     def make_controller(self):
         class Value:
             def set(self, text):
                 self.value = text
+
+            def get(self):
+                return self.value
 
             def configure(self, **_):
                 pass
@@ -210,8 +254,11 @@ class StationTests(unittest.TestCase):
         station.current_roles = {"source", "probe"}
         station.capabilities = {}
         station.i2c_results, station.i2c_queue, station.i2c_run = {}, [], None
+        station.connector_modes, station.connector_cancelled = (), False
         station.suite_active = station.suite_completed = False
+        station.completed_report = None
         station.suite_gpio_started = station.gpio_snapshot = None
+        station.finish_plan = station.finish_worker = station.gpio_sequence = station.gpio_stop = None
         for role, tests in EXPECTED.items():
             for name, expected in tests.items():
                 station.peripherals.power_result(role, {"test": name, "pass": True, "detail": expected})
@@ -231,6 +278,249 @@ class StationTests(unittest.TestCase):
         station.note = lambda text: None
         station.transmit = lambda role, command: station.commands.append((role, command))
         return station
+
+    def test_full_workflow_waits_for_gui_network_setup_then_uses_selected_adapter(self):
+        station = self.make_controller()
+        station.closing, station.phase, station.suite_active = False, "WAITING_ETH", True
+        station.view = Mock()
+        station.view.network_panel.changing = False
+        with patch("app.EthernetPeer") as peer:
+            station.start_ethernet()
+            self.assertEqual(station.phase, "WAITING_ETH")
+            self.assertEqual(station.commands, [])
+            peer.assert_not_called()
+            ready = station.view.network_panel.prepare.call_args.args[0]
+            ready(12)
+            peer.assert_called_once_with(12)
+        self.assertEqual(station.phase, "I2C_RUNNING")
+        self.assertEqual(station.i2c_run.mode, "ETH")
+        self.assertEqual(station.suite_stage, "ethernet")
+
+    def test_old_network_setup_callback_cannot_start_after_usb_reconnect(self):
+        station = self.make_controller()
+        station.closing = False
+        station.view = Mock()
+        station.view.network_panel.changing = False
+        station.start_ethernet()
+        ready = station.view.network_panel.prepare.call_args.args[0]
+        station.generation += 1
+        with patch("app.EthernetPeer") as peer:
+            ready(12)
+            peer.assert_not_called()
+        self.assertEqual(station.commands, [])
+
+    def test_network_configuration_blocks_competing_output_tests(self):
+        station = self.make_controller()
+        station.view = Mock()
+        station.view.network_panel.changing = True
+        station.start()
+        station.start_i2c()
+        station.self_check()
+        self.assertEqual(station.commands, [])
+        self.assertEqual(station.phase, "READY")
+
+    def confirm_stop(self, run):
+        self.assertEqual(run.phase, "STOPPING")
+        for role in sorted(run.roles):
+            run.handle(role, {"type": "stopped", "session": run.session, "reason": "requested"}, run.now + .001)
+        self.assertTrue(run.outputs_stopped)
+
+    def completed_controller(self, failed_signal=None, onboard_fault=False, pending_last=False):
+        from app import I2C_MODES, ADC_MODES, TESTS
+        station = self.make_controller()
+        station.capabilities = {role: {"i2c_simulators": 2, "adc_levels": 2} for role in ("source", "probe")}
+        for row, result in zip(station.profile["channels"], station.assessment.results):
+            result.status = "FAIL" if row["id"] == failed_signal else "PASS"
+        if onboard_fault:
+            station.peripherals.power["source"]["bmm150_i2c4"] = {"status": "FAIL", "pass": False, "detail": 0}
+            station.peripherals.summaries["source"]["pass"] = False
+        station.gpio_snapshot = station.report_snapshot()
+        station._start_connector_modes(list(I2C_MODES + ADC_MODES))
+        station.suite_active = True
+        for mode in I2C_MODES + ADC_MODES:
+            self.assertEqual(station.i2c_run.mode, mode)
+            for name, spec in DEVICES.items():
+                good = not onboard_fault or name != "bmm150_i2c4"
+                station.peripherals.current_result({"test": name, "pass": good, "detail": spec["id"] if good else 0})
+            if mode in ADC_MODES: station.i2c_run.result.adc_voltage_mv = TESTS[mode]["expected_mv"]
+            station.i2c_run.complete("Completed measurement")
+            if pending_last and mode == ADC_MODES[-1]:
+                station._update_i2c()
+                return station
+            self.confirm_stop(station.i2c_run); station._update_i2c()
+        return station
+
+    def test_full_suite_is_not_frozen_or_completed_until_final_stop_replies(self):
+        station = self.completed_controller(pending_last=True)
+        run = station.i2c_run
+        self.assertEqual(station.phase, "I2C_RUNNING")
+        self.assertIsNone(station.completed_report)
+        self.assertFalse(station.report_snapshot()["test_suite_completed"])
+        self.assertFalse(station.report_snapshot()["external_suite_passed"])
+        self.assertNotIn("TEST COMPLETE", station.state.get())
+        station.handle("source", {"type": "stopped", "session": run.session, "reason": "requested"})
+        self.assertIsNone(station.completed_report)
+        station.handle("probe", {"type": "stopped", "session": run.session, "reason": "requested"})
+        self.assertEqual(station.phase, "COMPLETE")
+        self.assertTrue(station.completed_report["test_suite_completed"])
+        self.assertIn("TEST COMPLETE", station.state.get())
+
+    def test_manual_self_check_clears_cached_connector_passes(self):
+        station = self.completed_controller()
+        station.self_check()
+        report = station.report_snapshot()
+        self.assertFalse(report["adc_passed"])
+        self.assertFalse(report["i2c_passed"])
+        self.assertEqual(station.adc_summary("ADIO_ADC_3V3")["status"], "NOT RUN")
+        self.assertEqual(report["connector_tests"], {})
+
+    def test_parent_stop_reaches_protocol_owner_and_prevents_further_pings(self):
+        from protocol_app import ProtocolStation
+        from protocol_model import ProtocolRun
+        station = self.make_controller()
+        station.links, station.hello, station.phase = {}, {}, "DISCONNECTED"
+        child = ProtocolStation.__new__(ProtocolStation)
+        child.network_panel = Mock()
+        child.closed, child.demo, child.udp = False, False, None
+        child.results, child.links, child.status = {}, {}, type(station.state)()
+        child.run = ProtocolRun("ADC3V3_HIGH", station.digest, 10, station.transmit)
+        child.run.phase, child.run.started = "RUNNING", {"source", "probe"}
+        child.run.last_seen = {role: 10 for role in child.run.roles}
+        station.protocol_window = child
+        with patch("protocol_app.time.monotonic", return_value=10): station.stop()
+        self.assertEqual(child.run.phase, "STOPPING")
+        self.assertIn("waiting for STOP confirmation", station.state.get())
+        self.assertNotIn("outputs stopped", station.state.get())
+        child.run.tick(10.8)
+        self.assertEqual(set(station.commands), {("source", "STOP"), ("probe", "STOP")})
+        self.confirm_stop(child.run)
+        self.assertEqual(child.run.phase, "STOPPED")
+
+    def test_selected_adc_retest_counts_only_current_modes_and_exports_scope(self):
+        station = self.completed_controller()
+        station.start_adc("ADIO_ADC_3V3")
+        for _ in range(2):
+            station.i2c_run.complete("Retested voltage")
+            self.confirm_stop(station.i2c_run); station._update_i2c()
+        self.assertEqual(len(station.i2c_results), 10)
+        self.assertIn("2/2 PASS", station.state.get())
+        self.assertNotIn("10/10", station.state.get())
+        report = station.report_snapshot()
+        self.assertEqual(report["selected_connector_modes"], ["ADC3V3_LOW", "ADC3V3_HIGH"])
+        self.assertEqual(set(report["selected_connector_results"]), {"ADC3V3_LOW", "ADC3V3_HIGH"})
+        self.assertFalse(report["test_suite_completed"])
+        self.assertFalse(report["all_passed"])
+
+    def test_selected_i2c_retest_cannot_hide_failure_in_cached_passes(self):
+        station = self.completed_controller()
+        station.start_i2c("GPS1_I2C")
+        station.i2c_run.fail("No slave ACK")
+        self.confirm_stop(station.i2c_run); station._update_i2c()
+        self.assertIn("0/1 PASS", station.state.get())
+        self.assertNotIn("9/10", station.state.get())
+
+    def test_queue_and_completion_wait_for_both_stop_acknowledgements(self):
+        station = self.make_controller()
+        station.capabilities = {role: {"i2c_simulators": 2, "adc_levels": 2} for role in ("source", "probe")}
+        with patch("app.time.monotonic", return_value=1): station.start_adc("ADIO_ADC_3V3")
+        run = station.i2c_run
+        run.complete("Measured")
+        station._update_i2c()
+        self.assertIs(station.i2c_run, run)
+        self.assertEqual(station.phase, "I2C_RUNNING")
+        self.assertNotIn("COMPLETE", station.state.get())
+        with patch("app.time.monotonic", return_value=1.1):
+            station.handle("source", {"type": "stopped", "session": run.session, "reason": "requested"})
+            self.assertIs(station.i2c_run, run)
+            station.handle("probe", {"type": "stopped", "session": run.session, "reason": "requested"})
+        self.assertEqual(station.i2c_run.mode, "ADC3V3_HIGH")
+        self.assertTrue(station.i2c_results["ADC3V3_LOW"]["outputs_stopped"])
+
+    def test_unconfirmed_stop_aborts_queue_and_blocks_restart_until_reconnect(self):
+        station = self.make_controller()
+        station.capabilities = {role: {"i2c_simulators": 2, "adc_levels": 2} for role in ("source", "probe")}
+        station.start_i2c()
+        run = station.i2c_run
+        run.complete("Measured")
+        run.tick(run.deadline + .01)
+        station._update_i2c()
+        self.assertEqual(station.phase, "STOPPED")
+        self.assertEqual(station.i2c_queue, [])
+        self.assertIn("STOP unconfirmed", station.state.get())
+        self.assertNotIn("outputs stopped", station.state.get())
+        station.start_i2c("GPS1_I2C")
+        station.self_check()
+        saved = copy.deepcopy(station.i2c_results)
+        station.start_full_test()
+        self.assertIs(station.i2c_run, run)
+        self.assertEqual(station.phase, "STOPPED")
+        self.assertEqual(station.i2c_results, saved)
+
+    def test_operator_cancel_waits_for_ack_without_marking_suite_complete(self):
+        station = self.make_controller()
+        station.capabilities = {role: {"i2c_simulators": 2} for role in ("source", "probe")}
+        station.start_i2c()
+        station.stop("Operator cancelled")
+        self.assertEqual(station.phase, "I2C_RUNNING")
+        self.assertEqual(station.i2c_run.phase, "STOPPING")
+        self.confirm_stop(station.i2c_run); station._update_i2c()
+        self.assertEqual(station.phase, "STOPPED")
+        self.assertFalse(station.suite_completed)
+        self.assertIn("outputs stopped (confirmed)", station.state.get())
+
+    def test_full_completion_separates_interface_and_onboard_results(self):
+        station = self.completed_controller(onboard_fault=True)
+        self.assertEqual(station.phase, "COMPLETE")
+        self.assertTrue(station.state.value.startswith("TEST COMPLETE"))
+        self.assertIn("interfaces PASS: 43/43", station.state.value)
+        self.assertIn("onboard 9/10", station.state.value)
+        self.assertFalse(station.report_snapshot()["all_passed"])
+
+    def test_connector_passes_cannot_hide_a_failed_gpio_in_completion(self):
+        station = self.completed_controller(failed_signal="PPM_SIGNAL")
+        self.assertIn("interfaces FAIL: 42/43", station.state.value)
+        self.assertIn("10/10 I2C/ADC checks", station.state.value)
+        self.assertFalse(station.report_snapshot()["external_suite_passed"])
+
+    def test_completed_measurements_survive_usb_disconnect_and_late_frames(self):
+        station = self.completed_controller()
+        original = station.report_snapshot()
+        station.handle("source", {"type": "disconnected"})
+        station.handle("probe", {"type": "sample", "session": station.assessment.session, "channel": 0,
+                                 "seq": 99, "edges": 0, "span_us": 0, "frequency_millihz": 0, "timing_errors": 0})
+        report = station.report_snapshot()
+        self.assertEqual(station.phase, "COMPLETE")
+        self.assertEqual(report["utc"], original["utc"])
+        self.assertEqual(report["channels"], original["channels"])
+        self.assertTrue(report["all_passed"])
+        self.assertFalse(report["usb_connected"]["source"])
+        self.assertIn("completed results retained", station.state.value)
+        self.assertTrue(all(result.status == "PASS" for result in station.assessment.results))
+        report["channels"][0]["status"] = "FAIL"
+        self.assertEqual(station.report_snapshot()["channels"][0]["status"], "PASS")
+
+    def test_completed_result_cannot_start_a_new_test_with_an_offline_source(self):
+        station = self.completed_controller()
+        station.handle("source", {"type": "disconnected"})
+        station.commands.clear()
+        station.start_full_test(); station.start_adc()
+        self.assertEqual(station.commands, [])
+        self.assertIsNotNone(station.completed_report)
+
+    def test_new_self_check_clears_the_completed_snapshot(self):
+        station = self.completed_controller()
+        station.self_check()
+        self.assertIsNone(station.completed_report)
+        self.assertFalse(station.suite_completed)
+        self.assertEqual(station.phase, "CHECKING")
+        self.assertFalse(station.report_snapshot()["all_passed"])
+
+    def test_usb_handshake_failure_does_not_claim_unmeasured_pins_failed(self):
+        station = self.make_controller()
+        station.phase = "CONNECTING"
+        station.handle("source", {"type": "link_error", "reason": "USB disconnected"})
+        self.assertEqual(station.phase, "STOPPED")
+        self.assertTrue(all(row.status == "NOT RUN" for row in station.assessment.results))
 
     def critical_details(self, station, role):
         tests = (("hrt_clock", 5000), ("gpio_inputs", 43), ("i2c1_no_attached_devices", 0)) if role == "source" else (("hrt_clock", 5000), ("gpio_inputs", 43), (station.peripherals.probe_check, 1))
@@ -270,6 +560,10 @@ class StationTests(unittest.TestCase):
                     for role in ("probe", "source"):
                         station.handle(role, dict(type="protocol_sample", session=run.session, mode=mode, seq=sequence,
                                                   tx=sequence*20, rx=sequence*20, errors=0, detail=0, **{"pass": True}))
+            self.assertEqual(run.phase, "STOPPING")
+            with patch("app.time.monotonic", return_value=5.1):
+                for role in ("source", "probe"):
+                    station.handle(role, dict(type="stopped", session=run.session, reason="requested"))
             self.assertEqual(station.i2c_results[mode]["status"], "PASS", TESTS[mode]["name"])
             self.assertEqual(station.phase, "I2C_COMPLETE")
             self.assertEqual(station.peripherals.latest["bmm150_i2c4"]["status"], "FAIL")
@@ -285,7 +579,7 @@ class StationTests(unittest.TestCase):
             self.assertEqual(station.i2c_run.mode, mode)
             if index == 0: station.i2c_run.fail("No slave ACK")
             else: station.i2c_run.complete("Verified connector")
-            station._update_i2c()
+            self.confirm_stop(station.i2c_run); station._update_i2c()
         self.assertEqual(station.phase, "I2C_COMPLETE")
         self.assertEqual(set(station.i2c_results), set(I2C_MODES))
         self.assertEqual(station.i2c_results[I2C_MODES[0]]["status"], "FAIL")
@@ -369,9 +663,20 @@ class StationTests(unittest.TestCase):
 
     def test_restart_stops_outputs_then_repeats_both_checks(self):
         station = self.make_controller()
+        station.assessment.reset("a" * 32)
+        callbacks = []
+        station.closing = False
+        station.root = Mock()
+        station.root.after.side_effect = lambda _, callback: callbacks.append(callback)
         station.phase = "RUNNING"
         station.start()
-        self.assertEqual(station.commands[:2], [("source", "STOP"), ("probe", "STOP")])
+        self.assertEqual(station.phase, "STOPPING_GPIO")
+        self.assertEqual(station.commands, [("source", "STOP " + "a"*32), ("probe", "STOP " + "a"*32)])
+        for role in ("source", "probe"):
+            station.gpio_stop.handle(role, {"type": "stopped", "session": "a"*32, "reason": "requested"}, station.gpio_stop.started_at + .1)
+        station.poll_gpio_stop(station.gpio_stop.started_at + .2)
+        self.assertEqual(len(callbacks), 1)
+        callbacks.pop()()
         self.assertEqual([command.split()[0] for _, command in station.commands[2:]], ["CHECK", "CHECK"])
         self.assertTrue(station.auto_start)
         session = station.assessment.session
@@ -405,7 +710,7 @@ class StationTests(unittest.TestCase):
         station = self.make_controller()
         station.phase = "RUNNING"
         station.handle("source", dict(type="hello"))
-        self.assertEqual(station.phase, "STOPPED")
+        self.assertEqual(station.phase, "STOPPING_GPIO")
         self.assertNotIn("source", station.hello)
         station = self.make_controller()
         station.start()
@@ -431,7 +736,7 @@ class StationTests(unittest.TestCase):
         station.draw_results = lambda: None
         with patch("app.time.monotonic", return_value=10):
             station.pump()
-        self.assertEqual(station.phase, "STOPPED")
+        self.assertEqual(station.phase, "STOPPING_GPIO")
         self.assertFalse(station.assessment.all_passed)
         self.assertTrue(all(row.status == "FAIL" for row in station.assessment.results))
 
@@ -523,12 +828,18 @@ class StationTests(unittest.TestCase):
                 else:
                     with filename.open(encoding="utf-8-sig", newline="") as stream:
                         rows = list(csv.DictReader(stream))
-                    self.assertEqual(len(rows), len(self.profile["channels"]))
-                    buzzer = next(row for row in rows if row["id"] == "GPS1_BUZZER")
+                    signals = [row for row in rows if row["record_type"] == "signal"]
+                    self.assertEqual(len(signals), len(self.profile["channels"]))
+                    buzzer = next(row for row in signals if row["id"] == "GPS1_BUZZER")
                     self.assertEqual(buzzer["probe_pull"], "up")
-                    report = {key: json.loads(rows[0][key]) for key in ("devices", "startup_check_details")}
-                self.assertEqual(report["devices"], station.identities)
-                self.assertEqual(report["startup_check_details"], station.check_details)
+                    self.assertEqual(rows[0]["source_device"], station.identities["source"]["device_id"])
+                    self.assertEqual(rows[0]["source_firmware"], station.identities["source"]["firmware"])
+                    checks = [row for row in rows if row["record_type"] == "startup"]
+                    self.assertEqual([(r["module"], r["signal"], r["status"], int(r["detail"])) for r in checks],
+                                     [("source", "bmm150", "PASS", 50)])
+                if suffix == "json":
+                    self.assertEqual(report["devices"], station.identities)
+                    self.assertEqual(report["startup_check_details"], station.check_details)
 
     def test_connector_diagram_rejects_wrong_net_or_missing_pin(self):
         source = Path(__file__).resolve().parents[1] / "connectors.json"
@@ -574,7 +885,7 @@ class StationTests(unittest.TestCase):
         station.assessment.reset("a" * 32)
         with patch("app.time.monotonic", return_value=10):
             station.handle("source", dict(type="heartbeat", session="a" * 32, running=True, _received_at=7))
-        self.assertEqual(station.phase, "STOPPED")
+        self.assertEqual(station.phase, "STOPPING_GPIO")
         self.assertNotIn("source", station.last_seen)
 
     def test_receiver_timestamp_is_used_instead_of_gui_delivery_time(self):
@@ -592,7 +903,7 @@ class StationTests(unittest.TestCase):
             for suffix in ("json", "csv"):
                 target = Path(temporary) / ("report." + suffix)
                 target.write_text("previous completed report")
-                writer = "app.json.dump" if suffix == "json" else "app.csv.DictWriter.writerows"
+                writer = "app.json.dump" if suffix == "json" else "completion.csv.DictWriter.writerows"
                 with patch("app.filedialog.asksaveasfilename", return_value=str(target)), patch(writer, side_effect=OSError("disk full")), patch("app.messagebox.showerror") as error:
                     station.export()
                 error.assert_called_once()

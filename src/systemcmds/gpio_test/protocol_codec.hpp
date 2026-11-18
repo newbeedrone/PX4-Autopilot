@@ -6,7 +6,7 @@
 
 namespace protocol_test
 {
-enum class Mode : uint8_t { None, I2c3, Gps2, Sbus, Dsm, Can, Ethernet, Gps1, Power1, Power2, SharedI2c3, AdcLow, AdcHigh };
+enum class Mode : uint8_t { None, I2c3, Gps2, Sbus, Dsm, Can, Ethernet, Gps1, Power1, Power2, SharedI2c3, AdcLow, AdcHigh, Adc3v3Low, Adc3v3High, IoPwm1, IoPwm2, IoPwm3, IoPwm4, IoPwm5, IoPwm6, IoPwm7, IoPwm8, SbusOut };
 constexpr unsigned PACKET_SIZE = 32;
 constexpr unsigned RC_CHANNELS = 7;
 constexpr uint8_t I2C_ADDRESS = 0x42;
@@ -14,7 +14,13 @@ constexpr uint16_t UDP_PORT = 14570;
 
 inline Mode mode(const char *name)
 {
-	return strcmp(name, "ADC6V6_LOW") == 0 ? Mode::AdcLow : strcmp(name, "ADC6V6_HIGH") == 0 ? Mode::AdcHigh :
+	if (strncmp(name, "IO_PWM", 6) == 0 && name[6] >= '1' && name[6] <= '8' && name[7] == '\0') {
+		return static_cast<Mode>(static_cast<unsigned>(Mode::IoPwm1) + name[6] - '1');
+	}
+
+	return strcmp(name, "SBUS_OUT") == 0 ? Mode::SbusOut : strcmp(name, "ADC3V3_LOW") == 0 ? Mode::Adc3v3Low : strcmp(name,
+			"ADC3V3_HIGH") == 0 ? Mode::Adc3v3High :
+	       strcmp(name, "ADC6V6_LOW") == 0 ? Mode::AdcLow : strcmp(name, "ADC6V6_HIGH") == 0 ? Mode::AdcHigh :
 	       strcmp(name, "GPS1_I2C") == 0 ? Mode::Gps1 : strcmp(name, "POWER1_I2C") == 0 ? Mode::Power1 :
 	       strcmp(name, "POWER2_I2C") == 0 ? Mode::Power2 : strcmp(name, "UART4_I2C3") == 0 ? Mode::SharedI2c3 :
 	       strcmp(name, "I2C3") == 0 ? Mode::I2c3 : strcmp(name, "GPS2_I2C") == 0 ? Mode::Gps2 :
@@ -25,6 +31,28 @@ inline Mode mode(const char *name)
 inline const char *name(Mode mode)
 {
 	switch (mode) {
+	case Mode::SbusOut: return "SBUS_OUT";
+
+	case Mode::IoPwm1: return "IO_PWM1";
+
+	case Mode::IoPwm2: return "IO_PWM2";
+
+	case Mode::IoPwm3: return "IO_PWM3";
+
+	case Mode::IoPwm4: return "IO_PWM4";
+
+	case Mode::IoPwm5: return "IO_PWM5";
+
+	case Mode::IoPwm6: return "IO_PWM6";
+
+	case Mode::IoPwm7: return "IO_PWM7";
+
+	case Mode::IoPwm8: return "IO_PWM8";
+
+	case Mode::Adc3v3Low: return "ADC3V3_LOW";
+
+	case Mode::Adc3v3High: return "ADC3V3_HIGH";
+
 	case Mode::AdcLow: return "ADC6V6_LOW";
 
 	case Mode::AdcHigh: return "ADC6V6_HIGH";
@@ -58,11 +86,22 @@ inline bool is_i2c(Mode mode)
 	return mode == Mode::I2c3 || mode == Mode::Gps2 || mode == Mode::Gps1 || mode == Mode::Power1 || mode == Mode::Power2
 	       || mode == Mode::SharedI2c3;
 }
-inline bool is_adc(Mode mode) { return mode == Mode::AdcLow || mode == Mode::AdcHigh; }
+inline bool is_adc_3v3(Mode mode) { return mode == Mode::Adc3v3Low || mode == Mode::Adc3v3High; }
+inline bool is_io_pwm(Mode mode) { return mode >= Mode::IoPwm1 && mode <= Mode::IoPwm8; }
+inline unsigned io_pwm_channel(Mode mode) { return static_cast<unsigned>(mode) - static_cast<unsigned>(Mode::IoPwm1); }
+inline unsigned io_pwm_hz(Mode mode)
+{
+	constexpr unsigned rates[] {50, 60, 75, 90, 110, 130, 160, 200};
+	return is_io_pwm(mode) ? rates[io_pwm_channel(mode)] : 0;
+}
+inline unsigned io_pwm_width(uint32_t token) { return 1100 + token % 601; }
+inline bool is_adc_high(Mode mode) { return mode == Mode::AdcHigh || mode == Mode::Adc3v3High; }
+inline bool is_adc(Mode mode) { return mode == Mode::AdcLow || mode == Mode::AdcHigh || is_adc_3v3(mode); }
 inline bool adc_voltage_valid(Mode mode, int millivolts)
 {
-	return mode == Mode::AdcLow ? millivolts >= 0 && millivolts <= 100 :
-	       mode == Mode::AdcHigh && millivolts >= 1500 && millivolts <= 1800;
+	return mode == Mode::AdcLow || mode == Mode::Adc3v3Low ? millivolts >= 0 && millivolts <= 100 :
+	       mode == Mode::AdcHigh ? millivolts >= 1500 && millivolts <= 1800 :
+	       mode == Mode::Adc3v3High && millivolts >= 3000 && millivolts <= 3400;
 }
 inline unsigned source_i2c(Mode mode)
 {

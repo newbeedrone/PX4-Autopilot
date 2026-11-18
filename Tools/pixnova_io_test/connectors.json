@@ -305,7 +305,9 @@
           "number": 7,
           "nets": [
             "SPIX_SYNC"
-          ]
+          ],
+          "label": "SPIX_SYNC / PE9",
+          "note": "Shared sensor sync \u00b7 NOT TESTED"
         },
         {
           "number": 8,
@@ -574,6 +576,30 @@
         {
           "number": 4,
           "nets": []
+        }
+      ]
+    },
+    {
+      "name": "P8",
+      "pins": [
+        {
+          "number": 1,
+          "nets": [],
+          "note": "Power: leave disconnected"
+        },
+        {
+          "number": 2,
+          "nets": [
+            "I2C2_DRDY_BAR1"
+          ],
+          "label": "SBUS OUT / PG5",
+          "note": "SBUS protocol receiver; schematic net name retained"
+        },
+        {
+          "number": 3,
+          "nets": [
+            "GND"
+          ]
         }
       ]
     }

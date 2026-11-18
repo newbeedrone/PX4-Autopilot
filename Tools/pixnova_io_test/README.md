@@ -4,6 +4,77 @@ This tool checks external signal continuity by generating distinct square-wave f
 Both boards connect to the same computer over USB CDC.
 It is a dedicated manufacturing configuration, separate from the flight firmware and `pixnova_doc` branch.
 
+## Complete Workflow: FMU, IOV2 PWM And Ethernet
+
+The normal **Start test** now runs these stages:
+
+1. Use **Normal firmware → Browse…** to choose the normal PixNova `.px4` image and select the **CSV folder**. The station validates board ID 5900, application vectors, size and the package, and freezes the selected image for this run. Test and bootloader images are rejected.
+2. Click **Start test**. Collect all onboard sensor/storage checks, then assess GPIO connector groups one at a time using fresh receiver windows. PPM is a flight-controller output to the fixture, using the existing 156.25 Hz port continuity test. FMU PWM is the last GPIO group. Completed group results remain recorded while the following groups run.
+3. Confirm both GPIO STOP replies, then automatically test the six simulated-slave I2C connectors, both ADC inputs at two levels and the physical CAN1↔CAN2 bus. A failed measurement is recorded and the sequence continues once output shutdown is confirmed; an unconfirmed shutdown aborts the sequence.
+4. Display **FMU tests finished** and wait with outputs stopped. Manually move the existing P21 harness from FMU PWM to IOV2 PWM1–8. Select **IOV2 PWM → Confirm IOV2 wiring** to continue. Test each IOV2 output separately; the other seven outputs remain zero. Then receive flight-controller **SBUS OUT** at fixture P8.2 / PG5. GPS2 stays connected throughout. The SBUS/DSM receiver simulators in the separate protocol utility are outside this automatic sequence.
+5. Start Ethernet last. Choose the connected **PC Ethernet** adapter before the run; the GUI prepares its test address automatically. If wiring or adapter selection is incomplete, remain at **WAITING_ETH** until corrected; **Test Ethernet** resumes the stage. The GUI adds temporary `192.168.77.1/24` when needed; accept the Windows administrator prompt. PixNova uses `192.168.77.2`, UDP port `14570`. Both endpoints verify fresh packets using a random run token, advancing sequence and CRC.
+6. After every stage and its STOP confirmations finish, automatically save a unique CSV containing all signal, protocol, onboard and summary results, including failures. Only after that file is saved, restore the selected normal flight firmware over USB. The source test firmware must advertise `usb_restore: 1`. The USB bootloader board ID and MCU serial must match the tested flight controller before erase. Programming, CRC verification and application reboot are separate required steps. Restoration results are added to the CSV. A save failure prevents flashing; a flash or final CSV update failure is displayed and the original measurement CSV is retained.
+
+The test firmware permits an identity-bound `BOOTLOADER` request only on the idle flight controller after successful cleanup. The fixture rejects this command. The bootloader and fixture firmware are retained. Firmware restoration runs in a background worker; the GUI remains responsive. An operator cancellation or unconfirmed STOP never triggers automatic restoration. In DEMO, the same complete sequence and CSV save run, but no USB firmware is changed.
+
+Partial connector tests retain signals outside their selected scope as **NOT RUN** and never trigger normal-firmware restoration. They do not claim completion of the full manufacturing suite. When returning from normal firmware to test firmware, fully power-cycle the flight controller and fixture before IOV2/SBUS OUT tests: a USB application reboot does not remove the separate IO MCU's previous setup. A rejected IO idle-state check is retained as a failure; no arming or safety-register override is used.
+
+**Start test** validates the selected normal firmware and CSV folder in a background worker before starting hardware tests. The GUI remains responsive during slow file access; **Stop** cancels preparation. Preparation times out after 30 seconds, and a cancelled, timed-out or disconnected preparation cannot start tests when file access eventually returns. Missing USB connections and preparation errors appear in the main status area.
+
+Manual GPIO cancellation, restart, self-check, connector switching and window handoff also wait for both session-bound STOP replies. Missing replies or cleanup failures block further tests until USB recovery; cancellation and disconnect revoke pending actions. Closing an active station waits for its protocol shutdown as well. Normal-firmware restoration uses the USB endpoints that owned the completed test, even if the port selection boxes were changed during the run.
+
+**Export report** is disabled during active measurement and output shutdown, so a native file dialog cannot interrupt the heartbeat. Manual CSV export uses the same complete schema as automatic saving: signals, protocols, onboard and power-on checks, startup details, restoration and summary rows. GPIO STOP confirmation and errors are included. A failed or aborted run can still be exported after its shutdown attempt; it retains its failure and never triggers normal-firmware restoration.
+
+CSV separates `measurement_status`, `finalization_status` and `workflow_status`. If all measurements pass, the initial CSV remains `PENDING` until normal-firmware restoration and the final CSV update finish. A restoration/save failure produces a failed overall summary even when every interface measurement passed. Measurement failures remain failed when restoration succeeds.
+
+The ordinary station's left connector list includes **IOV2 PWM** and **SBUS OUT** separately. IOV2 PWM opens the P21 diagram and eight output inspectors; SBUS OUT opens the P8 / PG5 diagram. Their sidebar results update independently and turn red on failure. **All ports** shows both connector diagrams alongside the FMU ports, and the pin totals include all 52 FMU/ADC, IOV2 and SBUS signals. The IOV2 PWM and Ethernet tabs also support separate retests. GPIO success alone cannot complete the extended workflow.
+
+PC network setup runs in the GUI under Windows Python. **Refresh** lists physical wired adapters with their link state and current addresses. Select the adapter connected to PixNova; the GUI retains its DHCP, existing IP addresses, default gateway and DNS. It adds only the temporary secondary test address, binds test traffic to that adapter and records ownership by adapter GUID. **Restore** removes only the address created by this application, including after restarting the GUI. A preexisting or externally replaced address is retained. Failure rollback repeats the same ownership checks as Restore; an address replaced or edited during Windows address verification is retained, and an unverified cleanup keeps its journal for a later retry. The address is temporary and does not survive a Windows restart. Configuration and the administrator helper run in the background so USB heartbeat processing remains responsive; cancelling permission prevents the test from starting. An unplugged cable can be configured, but testing waits for the link and address verification. No Windows network-settings dialog or manual IP command is required. A per-adapter process lock covers the complete configuration or restore transaction, including the ownership journal; a concurrent station receives a busy error and can retry after the first operation finishes. The same controls are available in the protocol station. DEMO uses a simulated adapter and never changes PC settings.
+
+The current paired firmware must advertise `io_pwm: 1`, `sbus_out: 1` and `session_stop: 1`. Update both boards together; the already-installed IO-v2 firmware uses its standard serial register protocol and is not reflashed. Start from idle IO firmware with zero arming, zero disarmed outputs and no enabled auxiliary output features. The normal RSSI ADC default is allowed and retained; SBUS output is enabled only during its dedicated test. Power-cycle after installing the flight-controller test image if the previous flight firmware left IO configured.
+
+| IOV2 output | IO-v2 MCU pin | Fixture input | Test frequency |
+| --- | --- | --- | --- |
+| PWM1 | PA0 | P21.8 / PI0 | 50 Hz |
+| PWM2 | PA1 | P21.7 / PH12 | 60 Hz |
+| PWM3 | PB8 | P21.6 / PH11 | 75 Hz |
+| PWM4 | PB9 | P21.5 / PH10 | 90 Hz |
+| PWM5 | PA6 | P21.4 / PD13 | 110 Hz |
+| PWM6 | PA7 | P21.3 / PD14 | 130 Hz |
+| PWM7 | PB0 | P21.2 / PH6 | 160 Hz |
+| PWM8 | PB1 | P21.1 / PH9 | 200 Hz |
+
+P21.9 is common ground; leave power pins disconnected and remove all actuators for this manufacturing test. Because IO timers share rate groups, channels are tested sequentially, each with a session-derived pulse width. The fixture measures actual frequency within ±2% over three fresh report windows and rejects activity on unselected inputs. Each accepted source window requires a distinct receiver report with advancing sequence and edge count. A missing receiver report or loss of signal resets the consecutive-window count. The GUI shows the IO MCU pin, fixture pin and measured frequency; failed outputs turn red. Click an output card for its frequency error, verified-window count and failure reason; **Retest** runs only that output and counts only its current result. The IOV2 tab works independently after the two USB handshakes, without running the FMU test first.
+
+The source checks both direct-command storage and the applied servo page, PWM rates and running flags. It allows the first write to settle until IO's next mixer tick; subsequent mismatches fail. A measured nonzero frequency outside tolerance fails immediately rather than waiting for the overall protocol timeout.
+
+To open directly at either independent test page:
+
+```sh
+python Tools/pixnova_io_test/app.py --iov2
+python Tools/pixnova_io_test/app.py --ethernet
+```
+
+Both commands open the ordinary station and wait for USB connection and the operator's test action; they do not enable outputs automatically.
+
+Only the IOV2 test adapter can write the selected direct PWM channel, zero disarmed values and PWM rates. Arming, safety-switch, mixer, failsafe and bootloader writes are rejected. STOP zeros the outputs, clears the temporary direct-PWM state, restores saved rates and reads back all three rate registers before confirming shutdown. A write acknowledgement without matching readback retains the pending cleanup and blocks the next test until cleanup succeeds. If the FMU stops running, the zero disarmed values suppress pulses after the IO firmware's 500 ms FMU timeout; loss of host heartbeat has the two-second FMU lease plus this IO timeout.
+
+Ethernet PHY startup has a bounded 20-second negotiation period; no application datagrams are sent before STARTED. The normal running heartbeat lease remains two seconds. Link status alone never passes: fresh traffic must be independently verified by both endpoints, and a missing cable, bad packet, timeout or link loss fails the test. Reports include `iov2_tests`, `iov2_passed`, `ethernet_test`, `ethernet_passed`, `pc_ethernet` and `extended_suite`.
+
+## SBUS OUT On Fixture PG5
+
+Connect the flight-controller **SBUS OUT** signal to fixture **P8.2 / PG5** and ground to **P8.3**; leave P8.1 power disconnected. The RevA schematic calls this PG5 net `I2C2_DRDY_BAR1`, but P8 is the SBUS OUT connector. This test is separate from the **SBUS receiver input** simulator, which sends in the opposite direction through fixture UART8.
+
+The left connector list includes **SBUS OUT**, with its own PASS/FAIL status. Selecting it opens the P8 pin diagram, PG5 inspector and IOV2 test controls; selecting a port does not start outputs. The same P8 diagram appears in **All ports** and, after a failure, **Failed pins**. **Test SBUS OUT** runs it independently after both USB handshakes; the complete workflow also runs it after PWM1–8. The inspector shows IO PB10 → P8.2 / PG5, measured frame rate, decoded frame count, verification windows and failure reason. Failed or missing frames turn the sidebar entry, connector pin, card and signal path red.
+
+The flight controller requests SBUS1 at 50 frames/s through PX4IO, continually confirms the feature/rate/applied servo registers and keeps all eight PWM commands zero. PG5 remains input-only. Its EXTI edge timestamps decode inverted 100000 baud 8E2; the 50 μs GPIO/PWM sampler is not used. Every 25-byte frame must have valid parity and stop bits, header, flags, footer and a complete zero-output payload. Supported IO encodings are all sixteen raw channels zero, or the legacy first eight raw channels 0x7ff with the remaining eight zero; mixed or arbitrary channel patterns are rejected. A requested 50 Hz SBUS rate accepts 40–55 measured frames/s to allow the installed IO mixer's scheduling. Each complete report window must also contain 40–55 valid frames per second over its actual elapsed duration, with one boundary frame allowed for quantization. Snapshot and window reset are atomic and occur at report time, including when a report falls between the 100 ms processing callbacks. Three fresh valid windows are required; a short 50 Hz burst followed by silence cannot pass.
+
+STOP restores the saved IO features (including the original RSSI selection), SBUS rate and PWM configuration, verifies the readback and waits for both USB acknowledgements. Cleanup failures block further runs until STOP succeeds or the USB endpoints are reconnected. No arming/safety/mixer/bootloader writes are permitted. With a stopped FMU, the installed IO firmware can continue transmitting its zero-output SBUS frames until the feature is disabled or IO loses power; an absent STOP acknowledgement cannot pass. Reports include `sbus_out_test` and `sbus_out_passed`; the full workflow requires this result as well as the eight PWM results and Ethernet.
+
+The fixture protocol image uses NuttX RAM vectors in uncached DTCM and a direct high-priority EXTI5–9 handler for PG5, so ordinary RTOS critical sections do not delay its edges. The handler makes no RTOS, USB, floating-point or HRT API calls; it extends the existing 1 MHz TIM8 counter, also refreshed by the 1 ms watchdog during quiet periods. It owns the shared IRQ only during SBUS OUT, rejects other active EXTI6–9 owners, briefly masks its NVIC line for snapshots, and restores the normal vector and priority on STOP. The decoder follows each UART byte's bit clock rather than accumulating edge-to-edge timestamp rounding. Failed frames remain failures; reports retain capture diagnostics (error code, byte, bit, interval and phase) for timing, missing-edge, parity, stop-bit, length and payload faults. The fixture RTC uses internal LSI to avoid an unavailable external LSE clock blocking USB startup; frequency measurements continue to use TIM8, independently of RTC.
+
+The probe configuration excludes DTCM from the system heap (`CONFIG_STM32H7_DTCMEXCLUDE=y`) so allocator metadata cannot overwrite the vector table. The build checks both this setting and the ELF vector-table address/alignment before staging a protocol probe image. Flight-controller firmware retains its existing memory and RTC configuration.
+
 ## UART And Buzzer Frequency Tests
 
 All of the following signals use GPIO square-wave output on the flight controller
@@ -23,7 +94,7 @@ while the pull-up produced the expected frequency. The firmware applies
 `probe_pull: up` from the profile only to the receiver input; it does not drive
 the fixture pin as an output. GPS2 TX uses PE1 at approximately 51.546 Hz, received at P3 pin 5 (PE0);
 GPS2 RX uses PE0 at approximately 56.180 Hz, received at P3 pin 4 (PE1).
-The confirmed TELEM1, TELEM2, GPS2 and UART4 harnesses cross TX and RX:
+The confirmed TELEM1, TELEM2, TELEM3, GPS2 and UART4 harnesses cross TX and RX:
 
 | Flight-controller signal | Fixture receive position | Expected frequency |
 | --- | --- | --- |
@@ -31,6 +102,8 @@ The confirmed TELEM1, TELEM2, GPS2 and UART4 harnesses cross TX and RX:
 | TELEM1 RX, PF6 | P15.4, PE8, UART7 TX | 10.893 Hz |
 | TELEM2 TX, PC12 | P18.5, PD2, UART5 RX | 14.124 Hz |
 | TELEM2 RX, PD2 | P18.4, PC12, UART5 TX | 15.385 Hz |
+| TELEM3 TX, PD5 | P20.5, PA3, USART2 RX | 19.920 Hz |
+| TELEM3 RX, PA3 | P20.4, PD5, USART2 TX | 21.739 Hz |
 | GPS2 TX, PE1 | P3.5, PE0, UART8 RX | 51.546 Hz |
 | GPS2 RX, PE0 | P3.4, PE1, UART8 TX | 56.180 Hz |
 | UART4 TX, PH13 | P17.6, PH14, UART4 RX | 60.976 Hz |
@@ -39,7 +112,7 @@ The confirmed TELEM1, TELEM2, GPS2 and UART4 harnesses cross TX and RX:
 The GPIO tests follow this fixed mapping in [wiring.csv](wiring.csv).
 Each GUI row names the flight-controller signal and displays its fixture GPIO
 and pin. The fixture connector diagrams retain their schematic signal names.
-GPS1 UART, TELEM3 and CTS/RTS keep their existing mappings. Acceptance still
+GPS1 UART and CTS/RTS keep their existing mappings. Acceptance still
 requires the assigned signal's frequency within tolerance for three consecutive
 windows; a different signal's frequency fails and is identified when possible.
 This checks digital signal continuity, without transmitting UART data or testing
@@ -48,22 +121,30 @@ an attached buzzer's sound output.
 Only I2C SCL/SDA use simulated-slave transactions. The GPS1/GPS2 I2C cards do not
 replace the frequency tests for the UART or buzzer pins on the same connector.
 
-## ADC6V6 Voltage Test
+SPI6 also exposes `SPIX_SYNC`, PE9, at fixture P9 pin 7. It is protected as shared sensor synchronization and is outside the eight SPI6 GPIO frequency channels. The GUI labels it **Shared sensor sync · NOT TESTED**; the grey state is not a passing measurement.
 
-ADC6V6 is a flight-controller input with an approximately 1:2 resistor divider.
-The fixture drives P10.7/PF13 first low, then high at its nominal 3.3 V GPIO level.
-PixNova keeps PC2_C as an ADC input and samples ADC1 channel 12. The low test
-accepts 0–0.100 V; the high test accepts 1.500–1.800 V around the expected 1.65 V.
-Both boards must provide fresh readback for three report windows per level.
-The GUI shows both measured voltages, and the existing ADC6V6 pin turns red or
-green according to the combined result. **Test ADC** runs the two levels alone;
-the normal **Start test** includes them after the I2C tests.
+## ADC3V3 And ADC6V6 Voltage Tests
 
-This is an external input/divider check at 0 V and nominal 3.3 V stimulus. It does
-not calibrate ADC accuracy or test the full 6.6 V range. The flight controller
-never drives PC2 as a waveform output. Fixture STOP, USB/heartbeat expiry and
-test completion return PF13 to an input. Both firmware images advertise
-`adc_levels: 1`; the complete station rejects older images before starting.
+Both external ADC signals are tested as flight-controller inputs. The fixture
+applies 0 V and nominal 3.3 V through the existing ADIO harness; PixNova samples
+the selected input using ADC1. Neither PC2 nor PC3 generates GPIO waveforms.
+
+| Input | Fixture stimulus | Flight-controller ADC | Low acceptance | High acceptance |
+| --- | --- | --- | --- | --- |
+| ADC3V3 | P10.6 / PG10 | PC3_C / ADC1 channel 13 | 0–0.100 V | 3.000–3.400 V, nominal 3.3 V |
+| ADC6V6 | P10.7 / PF13 | PC2_C / ADC1 channel 12 | 0–0.100 V | 1.500–1.800 V, nominal 1.65 V after the 1:2 divider |
+
+Both boards must provide fresh readback for three report windows at each level.
+Each input has its own GUI card, low/high readbacks and pin status; a failure on
+one input does not mark the other input as passed or failed. **Test ADC** on a
+card runs that input's two levels. The normal **Start test** runs all four levels
+after the six I2C tests. Reports require both inputs for `adc_passed`.
+
+These checks verify the external input path at 0 V and nominal 3.3 V stimulus.
+They do not calibrate ADC accuracy or test the full ADC6V6 input range. Fixture
+STOP, USB/heartbeat expiry and test completion release the selected stimulus
+pin to an input. Both firmware images advertise `adc_levels: 2`; the complete
+station rejects the older single-input voltage firmware before starting.
 
 ## Connector Protocol Tests
 
@@ -110,7 +191,7 @@ The exact wiring and acceptance criteria appear beside each GUI test and in
 | GPS2 I2C | Flight-controller I2C2 PF1/PF0 to fixture I2C4 PF14/PF15, P3 pins 3/2. |
 | SBUS / DSM | Fixture UART8 TX PE1, P3 pin 4, temporarily jumpered to the appropriate flight-controller RC input. Disconnect this pin's normal GPS2 UART connection first. P4 PG13/PG12 cannot transmit hardware UART directly. |
 | CAN1 / CAN2 | Flight-controller CAN1 H/L connected externally to CAN2 H/L with correct bus termination and common ground. Disconnect the fixture's CAN headers. Classic CAN at 500 kbit/s; two distinct controllers must receive fresh frames. |
-| Ethernet | Correct PixNova Ethernet adapter to a real PC Ethernet interface. Flight controller `192.168.77.2/24`, PC `192.168.77.1/24`, UDP port `14570`. Configure the PC interface separately; the GUI does not change its network settings. Disconnect fixture P2. |
+| Ethernet | Correct PixNova Ethernet adapter to a real PC Ethernet interface. Flight controller `192.168.77.2/24`, PC `192.168.77.1/24`, UDP port `14570`. Choose the adapter in the GUI; Test Ethernet or Configure IP prepares its test address. Disconnect fixture P2. |
 
 The six I2C tests use address `0x42`, with a selected hardware controller or an edge-driven, open-drain software slave:
 
@@ -167,9 +248,9 @@ transaction or paired CAN test identifies the failing connection, not which
 individual wire or component caused it. ADC front-end design and physical waveform
 quality measurements are outside these protocol tests.
 
-The profile covers 43 signals: 42 GPIO frequency tests and one ADC6V6 voltage test. All I2C SCL/SDA signals are excluded from waveform generation, including GPS1 and POWER1.
+The profile covers 43 signals: 41 GPIO frequency tests and two ADC input voltage tests. All I2C SCL/SDA signals are excluded from waveform generation, including GPS1 and POWER1.
 It includes TELEM1–3, GPS UARTs, UART4, NFC, external SPI signals, PPM, eight FMU PWM signals, capture/armed signals, and the two external ADC signal paths.
-ADC3V3 is tested as a digital connection; ADC6V6 uses the separate input voltage test above.
+ADC3V3 and ADC6V6 both use the separate input voltage tests above.
 GPS1 and POWER1 share the flight controller’s I2C1 bus and use separate simulated-slave endpoints on the fixture. GPS2 and POWER2 similarly share flight-controller I2C2. Only the selected fixture slave responds at address `0x42`.
 
 ## Wiring And Electrical Scope
@@ -195,9 +276,9 @@ The following lines are protected and never configured as waveform outputs:
 - I2C1 PB8/PB9: GPS1/POWER1 slave-simulation tests only.
 - I2C3 PA8/PH8: base EEPROM configured at address `0x51`, including the shared UART4/I2C3 connector.
 - I2C4 PF14/PF15: BMM150, BMP388 and IMU EEPROM.
-- PC2/PC2_C: ADC6V6 input/divider test only.
+- PC2/PC2_C and PC3/PC3_C: ADC6V6 and ADC3V3 input voltage tests only.
 - SPI1/2/3 IMUs, SPI5 FRAM and PE9 sensor synchronisation.
-- PX4IO UART, eight PX4IO PWM channels, DSM/SBUS, SBUS output and RSSI.
+- PX4IO UART and PWM: owned through the checked IOV2 protocol test, never FMU GPIO waveforms. DSM/SBUS receiver input and SBUS OUT each use a separate protocol test. RSSI remains excluded.
 - SWD, reset, BOOT0, debug UART, oscillators, USB, storage and power-control nets.
 
 ## Build The Two Firmware Images
@@ -268,7 +349,7 @@ On Windows, double-click `start_test_station.bat` to open the ordinary test stat
 Choose PixNova as the source. The probe port is optional when viewing flight-controller peripheral checks; two distinct USB ports are required for GPIO frequency tests.
 After a disconnect, stop the active operation and use **Connect USB** again; messages from the previous connection cannot change the new session.
 Select **Connect**, then **Start test**.
-The ordinary station’s **Start test** runs a six-second GPIO measurement, freezes that result, then tests all six I2C connectors sequentially using the simulated slaves and checks the two ADC6V6 voltage levels. Individual **Test I2C** and **Test ADC** buttons are available on the main page. GPIO waveforms stop before connector protocol tests begin; SCL/SDA and PC2 are never waveform outputs.
+The ordinary station’s **Start test** runs a six-second GPIO measurement, freezes that result, then tests all six I2C connectors and both ADC inputs at two voltage levels each. It waits for the manual IOV2 harness change and then Ethernet, as described above. Individual connector buttons remain available. GPIO waveforms stop before connector protocol tests begin; SCL/SDA, PC2 and PC3 are never waveform outputs.
 
 Every start repeats interface checks and collects fresh onboard diagnostics before output is enabled.
 Onboard faults remain visible while the external interface test proceeds; a failed
@@ -288,7 +369,25 @@ Missing edges, wrong frequency, sampling overruns, stale sessions and USB/heartb
 Reports can be exported to JSON or CSV, including profile digest, session, self-check state and per-channel results.
 Exports freeze a freshness-checked snapshot before opening the file dialog, including individual startup checks and both device identities. Suite exports include `i2c_tests`, `test_suite_completed`, `gpio_measurement_completed`, `i2c_passed` and `external_suite_passed`; untested connectors cannot produce an overall I2C pass.
 Reports are written to a temporary file beside the destination and replaced only after a complete write, so a write error preserves the previous report.
-Export a passing report while the run is active and every channel is green; a stopped or disconnected run is not reported as an active pass.
+The complete workflow ends with **TEST COMPLETE**, showing the signal count,
+connector-check count and onboard-check count separately. A GPIO failure cannot
+be hidden by passing I2C/ADC checks. Onboard faults remain independent and visible.
+Each connector test enters `STOPPING` after measurement. It reports PASS and starts
+the next test only after every participating board returns a fresh `stopped`
+reply for that session with reason `requested`. Heartbeats cease during this
+three-second wait. Missing replies abort the queue with **STOP unconfirmed**;
+reconnect USB before testing again. Operator cancellation also waits for these
+replies. The main window's Stop button controls the protocol window when it owns USB.
+Selected connector retests count only the modes selected for that batch. Other
+cards retain their recorded results; exports identify the current selection in
+`selected_connector_modes` and `selected_connector_results`.
+The completed report is frozen with its measurement timestamp. Disconnecting USB
+after completion updates the connection indicators and appends an offline notice;
+it does not turn recorded measurements into failures. Exports include the current
+`usb_connected` state while retaining the completed measurement values. A new
+connection, self-check or test clears the completed snapshot and requires fresh
+checks. Disconnects during an active measurement still stop outputs and fail that
+run; incomplete measurements cannot be converted into completed passes.
 
 Preview the interface without hardware:
 
@@ -379,10 +478,12 @@ CHECK <32-character-hex-session> <profile-sha256>
 START <32-character-hex-session> <profile-sha256>
 PING <32-character-hex-session>
 STOP
+STOP <32-character-hex-request-session>
 ```
 
 HELLO is followed by cached `power_check` records and a `power_checked` summary.
 Responses also include `check`, `checked`, `started`, `heartbeat`, `sample`, `stopped` or `error` frames.
+The session-bearing STOP acknowledges the request session even if a queued PCHECK was cancelled before firmware executed it. A cleanup failure returns `cleanup_failed` and cannot be accepted as confirmed shutdown.
 Samples include session, sequence, channel, frequency in millihertz, rising-edge count, measurement span in microseconds and interrupt-overrun count.
 The GUI independently checks that frequency agrees with edge count and span.
 Firmware uses measured HRT timestamps, rather than treating nominal polling intervals as elapsed time.
@@ -407,10 +508,10 @@ g++ -std=c++14 -Wall -Wextra -Werror -Isrc/systemcmds/gpio_test Tools/pixnova_io
 ```
 
 On a POSIX host with `g++`, the Python suite also compiles the actual firmware endpoint for both roles against simulated GPIO/HRT services.
-It verifies self-check gating, input-only GPIO measurement behaviour, GPIO configuration failures, STOP, USB errors and heartbeat expiry, and passes 126 real endpoint frequency frames through the Python assessment model.
+It verifies self-check gating, input-only GPIO measurement behaviour, GPIO configuration failures, STOP, USB errors and heartbeat expiry, and passes 123 real endpoint frequency frames through the Python assessment model.
 It also compiles the actual board checks with fault-injected buses, including a lost FRAM that still has cached geometry.
 The probe flags a sampling callback that takes 50 microseconds or longer as a timing error; that report window cannot pass.
-At the current settings, 42 frequency channels require 840,000 GPIO reads per second and roughly 8 KB/s of USB sample payload. ADC voltage samples use a separate, slower protocol phase.
+At the current settings, 41 frequency channels require 820,000 GPIO reads per second and roughly 8 KB/s of USB sample payload. ADC voltage samples use a separate, slower protocol phase.
 The highest test frequency is about 454.5 Hz, with at least 22 samples per waveform half period.
 USB bandwidth and sampling budget must still be verified on the physical fixture; the host demo does not measure MCU execution time.
 
@@ -418,6 +519,10 @@ With a desktop display available, check the interactive diagrams and fault highl
 
 ```sh
 python Tools/pixnova_io_test/tests/gui_smoke.py
+python Tools/pixnova_io_test/tests/protocol_gui_smoke.py
+python Tools/pixnova_io_test/tests/extended_gui_smoke.py
+python Tools/pixnova_io_test/tests/iov2_gui_smoke.py
+python Tools/pixnova_io_test/tests/sbus_out_gui_smoke.py
 ```
 
 To simulate every profile waveform across independent clock offsets and sampling phases:

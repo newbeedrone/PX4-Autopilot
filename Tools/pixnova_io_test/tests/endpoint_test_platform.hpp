@@ -4,6 +4,7 @@
 // Host substitutes for GPIO, HRT and PX4 services. The endpoint implementation
 // and its wire formatting are compiled unchanged by endpoint_test.cpp.
 #include <array>
+#include <cassert>
 #include <atomic>
 #include <stdint.h>
 #include <stdio.h>
@@ -34,6 +35,9 @@
 #define GPIO_PULLDOWN 0x400u
 #define GPIO_SPEED_2MHz 0x100u
 #define GPIO_OUTPUT_CLEAR 0u
+constexpr int REBOOT_TO_BOOTLOADER = 1;
+static unsigned test_reset_count = 0;
+inline int board_reset(int mode) { assert(mode == REBOOT_TO_BOOTLOADER); ++test_reset_count; return 0; }
 
 using hrt_abstime = uint64_t;
 using irqstate_t = unsigned;

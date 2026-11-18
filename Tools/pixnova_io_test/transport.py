@@ -19,7 +19,7 @@ class SerialEndpoint(threading.Thread):
         if "\n" in command or "\r" in command or len(command) > 150:
             raise ValueError("Invalid endpoint command")
         with self.command_lock:
-            if command == "STOP":
+            if command == "STOP" or command.startswith("STOP "):
                 # A queued START or old heartbeat must not execute after STOP.
                 while not self.commands.empty():
                     self.commands.get_nowait()

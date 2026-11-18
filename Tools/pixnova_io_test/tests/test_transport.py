@@ -98,6 +98,13 @@ class TransportTests(unittest.TestCase):
             endpoint.run()
         self.assertEqual(port.writes, [b"STOP\n"])
 
+    def test_session_stop_discards_a_queued_protocol_check_before_execution(self):
+        endpoint = SerialEndpoint("source", "FAKE_USB", queue.Queue())
+        endpoint.send("PCHECK old profile IO_PWM1")
+        endpoint.send("PROTO old profile IO_PWM1 12345678")
+        endpoint.send("STOP " + "a"*32)
+        self.assertEqual(list(endpoint.commands.queue), ["STOP " + "a"*32])
+
 
 if __name__ == "__main__":
     unittest.main()

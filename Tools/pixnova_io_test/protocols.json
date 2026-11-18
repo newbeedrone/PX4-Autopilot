@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "tests": [
     {
       "id": "I2C3",
@@ -66,7 +66,7 @@
         "source"
       ],
       "path": "PixNova ETH 192.168.77.2 \u2194 PC Ethernet 192.168.77.1 \u00b7 UDP 14570",
-      "wiring": "Disconnect ETH from fixture P2. Use the correct PixNova Ethernet adapter and a real PC Ethernet interface. Configure that isolated PC interface to 192.168.77.1/24 yourself. This application does not change PC network settings. Allow its UDP traffic through the interface firewall. USB remains connected for control.",
+      "wiring": "Disconnect ETH from fixture P2. Use the correct PixNova Ethernet adapter and a real PC Ethernet interface. Select PC Ethernet in this GUI; Configure IP or Start selected test adds the temporary 192.168.77.1/24 address while retaining DHCP, existing IP, gateway and DNS. Accept the Windows administrator prompt if requested. Restore removes only this application's test address. USB remains connected for control.",
       "criterion": "Physical PHY link plus fresh bidirectional, token/sequence/CRC-checked UDP request/response packets. Both the PC and flight controller must verify them."
     },
     {
@@ -135,7 +135,11 @@
       "criterion": "Fixture drives 0 V with verified GPIO readback. Flight-controller ADC must measure 0\u20130.1 V for three fresh report windows.",
       "stimulus_mv": 0,
       "minimum_mv": 0,
-      "maximum_mv": 100
+      "maximum_mv": 100,
+      "channel": "ADIO_ADC_6V6",
+      "adc_pin": "PC2_C",
+      "adc_channel": 12,
+      "expected_mv": 0
     },
     {
       "id": "ADC6V6_HIGH",
@@ -151,7 +155,220 @@
       "criterion": "Fixture drives 3.3 V with verified GPIO readback. Flight-controller ADC must measure 1.5\u20131.8 V for three fresh report windows.",
       "stimulus_mv": 3300,
       "minimum_mv": 1500,
-      "maximum_mv": 1800
+      "maximum_mv": 1800,
+      "channel": "ADIO_ADC_6V6",
+      "adc_pin": "PC2_C",
+      "adc_channel": 12,
+      "expected_mv": 1650
+    },
+    {
+      "id": "ADC3V3_LOW",
+      "name": "ADC3V3 \u00b7 0 V",
+      "kind": "adc",
+      "group": "AD&IO",
+      "channel": "ADIO_ADC_3V3",
+      "adc_pin": "PC3_C",
+      "adc_channel": 13,
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "path": "Probe PG10 / P10.6 -> PixNova ADC3V3 input -> PC3_C / ADC1 IN13",
+      "wiring": "Connect the flight-controller ADC3V3 interface to fixture ADIO P10.6/PG10 and common ground. Both boards use USB power. The source ADC pin remains an input.",
+      "criterion": "Fixture drives 0 V with verified GPIO readback. Flight-controller ADC must measure 0\u20130.1 V for three fresh report windows.",
+      "stimulus_mv": 0,
+      "expected_mv": 0,
+      "minimum_mv": 0,
+      "maximum_mv": 100
+    },
+    {
+      "id": "ADC3V3_HIGH",
+      "name": "ADC3V3 \u00b7 3.3 V",
+      "kind": "adc",
+      "group": "AD&IO",
+      "channel": "ADIO_ADC_3V3",
+      "adc_pin": "PC3_C",
+      "adc_channel": 13,
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "path": "Probe PG10 / P10.6 -> PixNova ADC3V3 input -> PC3_C / ADC1 IN13",
+      "wiring": "Connect the flight-controller ADC3V3 interface to fixture ADIO P10.6/PG10 and common ground. Both boards use USB power. The source ADC pin remains an input.",
+      "criterion": "Fixture drives 3.3 V with verified GPIO readback. Flight-controller ADC must measure 3.0\u20133.4 V for three fresh report windows.",
+      "stimulus_mv": 3300,
+      "expected_mv": 3300,
+      "minimum_mv": 3000,
+      "maximum_mv": 3400
+    },
+    {
+      "id": "IO_PWM1",
+      "name": "IOV2 PWM1",
+      "kind": "io_pwm",
+      "group": "IOV2 PWM",
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "channel": 1,
+      "expected_hz": 50,
+      "probe_connector": "P21",
+      "probe_connector_pin": 8,
+      "probe_pin": "PI0",
+      "path": "PixNova IOV2 PWM1 -> fixture P21.8",
+      "wiring": "After the FMU test stops, move the complete PWM harness to the IOV2 PWM outputs. IOV2 PWM1 reaches fixture P21.8. Signal pins and common ground only; no actuators or servo power connected. Confirm the harness change before starting.",
+      "criterion": "Only output 1 is active, at 50 Hz. Independently measure that frequency on P21.8, reject activity on all other inputs, and require three fresh report windows.",
+      "source_io_pin": "PA0"
+    },
+    {
+      "id": "IO_PWM2",
+      "name": "IOV2 PWM2",
+      "kind": "io_pwm",
+      "group": "IOV2 PWM",
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "channel": 2,
+      "expected_hz": 60,
+      "probe_connector": "P21",
+      "probe_connector_pin": 7,
+      "probe_pin": "PH12",
+      "path": "PixNova IOV2 PWM2 -> fixture P21.7",
+      "wiring": "After the FMU test stops, move the complete PWM harness to the IOV2 PWM outputs. IOV2 PWM2 reaches fixture P21.7. Signal pins and common ground only; no actuators or servo power connected. Confirm the harness change before starting.",
+      "criterion": "Only output 2 is active, at 60 Hz. Independently measure that frequency on P21.7, reject activity on all other inputs, and require three fresh report windows.",
+      "source_io_pin": "PA1"
+    },
+    {
+      "id": "IO_PWM3",
+      "name": "IOV2 PWM3",
+      "kind": "io_pwm",
+      "group": "IOV2 PWM",
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "channel": 3,
+      "expected_hz": 75,
+      "probe_connector": "P21",
+      "probe_connector_pin": 6,
+      "probe_pin": "PH11",
+      "path": "PixNova IOV2 PWM3 -> fixture P21.6",
+      "wiring": "After the FMU test stops, move the complete PWM harness to the IOV2 PWM outputs. IOV2 PWM3 reaches fixture P21.6. Signal pins and common ground only; no actuators or servo power connected. Confirm the harness change before starting.",
+      "criterion": "Only output 3 is active, at 75 Hz. Independently measure that frequency on P21.6, reject activity on all other inputs, and require three fresh report windows.",
+      "source_io_pin": "PB8"
+    },
+    {
+      "id": "IO_PWM4",
+      "name": "IOV2 PWM4",
+      "kind": "io_pwm",
+      "group": "IOV2 PWM",
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "channel": 4,
+      "expected_hz": 90,
+      "probe_connector": "P21",
+      "probe_connector_pin": 5,
+      "probe_pin": "PH10",
+      "path": "PixNova IOV2 PWM4 -> fixture P21.5",
+      "wiring": "After the FMU test stops, move the complete PWM harness to the IOV2 PWM outputs. IOV2 PWM4 reaches fixture P21.5. Signal pins and common ground only; no actuators or servo power connected. Confirm the harness change before starting.",
+      "criterion": "Only output 4 is active, at 90 Hz. Independently measure that frequency on P21.5, reject activity on all other inputs, and require three fresh report windows.",
+      "source_io_pin": "PB9"
+    },
+    {
+      "id": "IO_PWM5",
+      "name": "IOV2 PWM5",
+      "kind": "io_pwm",
+      "group": "IOV2 PWM",
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "channel": 5,
+      "expected_hz": 110,
+      "probe_connector": "P21",
+      "probe_connector_pin": 4,
+      "probe_pin": "PD13",
+      "path": "PixNova IOV2 PWM5 -> fixture P21.4",
+      "wiring": "After the FMU test stops, move the complete PWM harness to the IOV2 PWM outputs. IOV2 PWM5 reaches fixture P21.4. Signal pins and common ground only; no actuators or servo power connected. Confirm the harness change before starting.",
+      "criterion": "Only output 5 is active, at 110 Hz. Independently measure that frequency on P21.4, reject activity on all other inputs, and require three fresh report windows.",
+      "source_io_pin": "PA6"
+    },
+    {
+      "id": "IO_PWM6",
+      "name": "IOV2 PWM6",
+      "kind": "io_pwm",
+      "group": "IOV2 PWM",
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "channel": 6,
+      "expected_hz": 130,
+      "probe_connector": "P21",
+      "probe_connector_pin": 3,
+      "probe_pin": "PD14",
+      "path": "PixNova IOV2 PWM6 -> fixture P21.3",
+      "wiring": "After the FMU test stops, move the complete PWM harness to the IOV2 PWM outputs. IOV2 PWM6 reaches fixture P21.3. Signal pins and common ground only; no actuators or servo power connected. Confirm the harness change before starting.",
+      "criterion": "Only output 6 is active, at 130 Hz. Independently measure that frequency on P21.3, reject activity on all other inputs, and require three fresh report windows.",
+      "source_io_pin": "PA7"
+    },
+    {
+      "id": "IO_PWM7",
+      "name": "IOV2 PWM7",
+      "kind": "io_pwm",
+      "group": "IOV2 PWM",
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "channel": 7,
+      "expected_hz": 160,
+      "probe_connector": "P21",
+      "probe_connector_pin": 2,
+      "probe_pin": "PH6",
+      "path": "PixNova IOV2 PWM7 -> fixture P21.2",
+      "wiring": "After the FMU test stops, move the complete PWM harness to the IOV2 PWM outputs. IOV2 PWM7 reaches fixture P21.2. Signal pins and common ground only; no actuators or servo power connected. Confirm the harness change before starting.",
+      "criterion": "Only output 7 is active, at 160 Hz. Independently measure that frequency on P21.2, reject activity on all other inputs, and require three fresh report windows.",
+      "source_io_pin": "PB0"
+    },
+    {
+      "id": "IO_PWM8",
+      "name": "IOV2 PWM8",
+      "kind": "io_pwm",
+      "group": "IOV2 PWM",
+      "roles": [
+        "source",
+        "probe"
+      ],
+      "channel": 8,
+      "expected_hz": 200,
+      "probe_connector": "P21",
+      "probe_connector_pin": 1,
+      "probe_pin": "PH9",
+      "path": "PixNova IOV2 PWM8 -> fixture P21.1",
+      "wiring": "After the FMU test stops, move the complete PWM harness to the IOV2 PWM outputs. IOV2 PWM8 reaches fixture P21.1. Signal pins and common ground only; no actuators or servo power connected. Confirm the harness change before starting.",
+      "criterion": "Only output 8 is active, at 200 Hz. Independently measure that frequency on P21.1, reject activity on all other inputs, and require three fresh report windows.",
+      "source_io_pin": "PB1"
+    },
+    {
+      "id": "SBUS_OUT",
+      "name": "SBUS OUT / PG5",
+      "kind": "sbus_out",
+      "group": "IOV2 PWM",
+      "roles": ["source", "probe"],
+      "expected_hz": 50,
+      "minimum_hz": 40,
+      "maximum_hz": 55,
+      "probe_connector": "P8",
+      "probe_connector_pin": 2,
+      "probe_pin": "PG5",
+      "source_io_pin": "PB10",
+      "path": "PixNova IOV2 SBUS OUT -> fixture P8.2 / PG5",
+      "wiring": "Connect flight-controller SBUS OUT signal to fixture P8.2 / PG5 and common ground to P8.3. Leave P8.1 power disconnected. The fixture is receive-only. All eight IOV2 PWM commands remain zero; no actuators attached.",
+      "criterion": "Inverted 100000 baud 8E2: decode complete 25-byte SBUS1 frames, including even parity, two stop bits and a complete disabled-output pattern (all raw channels zero, or legacy first eight 0x7ff and remaining eight zero). Require at least 20 frames, 40-55 frames/s for a requested 50 Hz rate, three fresh windows and confirmed STOP/restoration."
     }
   ]
 }

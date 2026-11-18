@@ -115,11 +115,11 @@
       "id": "TELEM3_TX",
       "group": "TELEM3",
       "source_pin": "PD5",
-      "probe_pin": "PD5",
+      "probe_pin": "PA3",
       "probe_connector": "P20",
-      "probe_connector_pin": 4,
-      "probe_net": "USART2_TX_TELEM3",
-      "note": "",
+      "probe_connector_pin": 5,
+      "probe_net": "USART2_RX_TELEM3",
+      "note": "Crossed UART harness: flight-controller TX -> fixture RX",
       "half_period_us": 25100,
       "expected_hz": 19.9203187250996
     },
@@ -127,11 +127,11 @@
       "id": "TELEM3_RX",
       "group": "TELEM3",
       "source_pin": "PA3",
-      "probe_pin": "PA3",
+      "probe_pin": "PD5",
       "probe_connector": "P20",
-      "probe_connector_pin": 5,
-      "probe_net": "USART2_RX_TELEM3",
-      "note": "",
+      "probe_connector_pin": 4,
+      "probe_net": "USART2_TX_TELEM3",
+      "note": "Crossed UART harness: flight-controller RX -> fixture TX",
       "half_period_us": 23000,
       "expected_hz": 21.73913043478261
     },
@@ -516,9 +516,8 @@
       "probe_connector": "P10",
       "probe_connector_pin": 6,
       "probe_net": "HIPOWER_5V_EN",
-      "note": "Digital continuity only; does not test ADC accuracy",
-      "half_period_us": 1200,
-      "expected_hz": 416.6666666666667
+      "note": "Fixture P10.6/PG10 drives 0 V and 3.3 V; PixNova PC3_C/ADC1 IN13 verifies 0 V and approximately 3.3 V",
+      "method": "adc_voltage"
     },
     {
       "id": "ADIO_ADC_6V6",
@@ -543,7 +542,7 @@
     },
     {
       "port": "PX4IO PWM / DSM-SBUS / SBUS OUT / RSSI",
-      "reason": "Owned by the I/O processor; excluded from this FMU-only phase"
+      "reason": "IOV2 PWM uses its checked protocol test after the manual P21 harness change; DSM/SBUS uses separate RC protocol tests; SBUS output and RSSI remain excluded"
     },
     {
       "port": "FMU/IO SWD, reset, boot and FMU debug UART",
@@ -563,7 +562,7 @@
     },
     {
       "port": "All I2C SCL/SDA, including GPS1 and POWER1",
-      "reason": "Use register-compatible IST8310 slave simulation; never generate GPIO waveforms"
+      "reason": "Use the token/CRC-checked simulated I2C slave at 0x42; never generate GPIO waveforms"
     }
   ],
   "protected_source_pins": {
@@ -593,9 +592,10 @@
     "PA8": "I2C3: configured onboard base EEPROM at 0x51",
     "PH8": "I2C3: configured onboard base EEPROM at 0x51",
     "PE9": "SPIX_SYNC: shared onboard sensor synchronization",
-    "PB8": "I2C1 SCL: GPS1 and POWER1 use an IST8310 simulator, never GPIO frequency output",
-    "PB9": "I2C1 SDA: GPS1 and POWER1 use an IST8310 simulator, never GPIO frequency output",
-    "PC2": "ADC6V6 divided input: never drive as GPIO; fixture supplies the voltage stimulus"
+    "PB8": "I2C1 SCL: GPS1 and POWER1 use the simulated slave at 0x42; never a GPIO frequency output",
+    "PB9": "I2C1 SDA: GPS1 and POWER1 use the simulated slave at 0x42; never a GPIO frequency output",
+    "PC2": "ADC6V6 divided input: never drive as GPIO; fixture supplies the voltage stimulus",
+    "PC3": "ADC3V3 voltage input; fixture stimulus only, never a waveform output"
   },
   "startup_checks": [
     "Firmware role, protocol and profile digest match",

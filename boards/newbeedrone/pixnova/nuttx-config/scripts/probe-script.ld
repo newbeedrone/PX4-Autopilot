@@ -182,6 +182,14 @@ SECTIONS
 
 	_eronly = ABSOLUTE(.);
 
+	/* RAM interrupt vectors must bypass the Cortex-M7 data cache. The NVIC
+	 * fetches this table directly; placing it in cached AXI SRAM can expose
+	 * stale vectors during startup or after attaching the SBUS fast handler.
+	 */
+	.ram_vectors (NOLOAD) : ALIGN(1024) {
+		KEEP(*(.ram_vectors))
+	} > DTCM1_RAM
+
 	.data : {
 		_sdata = ABSOLUTE(.);
 		*(.data .data.*)

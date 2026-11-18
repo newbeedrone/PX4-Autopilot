@@ -14,6 +14,20 @@
 #include <errno.h>
 #include <unistd.h>
 
+#if defined(CONFIG_GPIO_TEST_RECEIVER) && defined(CONFIG_ARCH_HIPRI_INTERRUPT)
+extern "C" {
+#include "ram_vectors.h"
+}
+#include <arch/armv7-m/nvicpri.h>
+#include <hardware/stm32_exti.h>
+#include <hardware/stm32_gpio.h>
+#include <hardware/stm32_tim.h>
+#if HRT_TIMER != 8
+#error "SBUS fast capture requires the PixNova 1 MHz HRT on TIM8"
+#endif
+ProtocolTest *ProtocolTest::_sbus_owner = nullptr;
+#endif
+
 #ifndef CONFIG_GPIO_TEST_RECEIVER
 #include <drivers/drv_adc.h>
 #include <px4_arch/adc.h>
@@ -31,6 +45,7 @@
 #include "stm32_fdcan_sock.h"
 #include "stm32_ethernet.h"
 #include <modules/px4iofirmware/protocol.h>
+#include "io_pwm_policy.hpp"
 #endif
 
 using protocol_test::Mode;
@@ -43,9 +58,24 @@ constexpr uint32_t INPUT = GPIO_INPUT | GPIO_FLOAT;
 constexpr uint32_t SIM_TX = GPIO_PORTE | GPIO_PIN1;
 constexpr uint32_t IO_TX = GPIO_PORTC | GPIO_PIN6;
 constexpr uint32_t IO_RX = GPIO_PORTC | GPIO_PIN7;
-constexpr uint32_t ADC_STIMULUS = GPIO_PORTF | GPIO_PIN13;
-constexpr uint32_t ADC_INPUT = GPIO_PORTC | GPIO_PIN2;
+constexpr uint32_t SBUS_OUT_RECEIVE = GPIO_PORTG | GPIO_PIN5; // Fixture P8.2, flight-controller SBUS OUT.
+constexpr uint32_t ADC6V6_STIMULUS = GPIO_PORTF | GPIO_PIN13;
+constexpr uint32_t ADC3V3_STIMULUS = GPIO_PORTG | GPIO_PIN10;
+constexpr uint32_t ADC6V6_INPUT = GPIO_PORTC | GPIO_PIN2;
+constexpr uint32_t ADC3V3_INPUT = GPIO_PORTC | GPIO_PIN3;
 constexpr unsigned ADC6V6_CHANNEL = 12;
+constexpr unsigned ADC3V3_CHANNEL = 13;
+constexpr uint32_t IO_RECEIVE_PINS[] {
+	GPIO_PORTI | GPIO_PIN0, GPIO_PORTH | GPIO_PIN12, GPIO_PORTH | GPIO_PIN11, GPIO_PORTH | GPIO_PIN10,
+	GPIO_PORTD | GPIO_PIN13, GPIO_PORTD | GPIO_PIN14, GPIO_PORTH | GPIO_PIN6, GPIO_PORTH | GPIO_PIN9
+}; // Fixture P21 pins 8..1; manually switch the complete harness after FMU PWM.
+
+#ifdef CONFIG_GPIO_TEST_RECEIVER
+uint32_t adc_stimulus(Mode mode)
+{
+	return protocol_test::is_adc_3v3(mode) ? ADC3V3_STIMULUS : ADC6V6_STIMULUS;
+}
+#endif
 
 #ifndef CONFIG_GPIO_TEST_RECEIVER
 int interface_flags(int fd, const char *name, bool up)
@@ -98,7 +128,7 @@ int can_receive_fifo0(uintptr_t base)
 
 int ProtocolTest::start(Mode mode, uint32_t token)
 {
-	if (active() || mode == Mode::None) { return -EINVAL; }
+	if (active() || _io_needs_cleanup || mode == Mode::None) { return -EINVAL; }
 
 #ifdef CONFIG_GPIO_TEST_RECEIVER
 
@@ -110,22 +140,36 @@ int ProtocolTest::start(Mode mode, uint32_t token)
 	_sample = {};
 	_sample.detail = -EAGAIN;
 	_expired.store(false);
+	_starting.store(true);
 	_slave_errors = 0;
 	_i2c_reading = false;
 	_slave_sequence = 0;
 	_have_rc_frames = false;
+
+	for (auto &edges : _io_edges) { edges = {}; }
+
+	_io_capture_time = 0;
+	_io_timing_errors = 0;
 	memset(_can_rx, 0, sizeof(_can_rx));
 	memset(_can_sequence, 0, sizeof(_can_sequence));
 	memset(_pending, 0, sizeof(_pending));
 	_feed = _step = _report = hrt_absolute_time();
 	hrt_call_every(&_watchdog, 1000, 1000, watchdog, this);
-	int result = protocol_test::is_i2c(mode) ? i2c_start() :
+	int result = mode == Mode::SbusOut ? sbus_out_start() : protocol_test::is_io_pwm(mode) ? io_pwm_start() : protocol_test::is_i2c(
+			     mode) ? i2c_start() :
 		     protocol_test::is_adc(mode) ? adc_start() :
 		     (mode == Mode::Sbus || mode == Mode::Dsm) ? uart_start() : network_start();
 
-	if (result >= 0 && (_expired.load() || hrt_absolute_time() - _feed > LEASE_US)) { result = -ETIMEDOUT; }
+	const hrt_abstime startup_limit = mode == Mode::Ethernet ? 20000000 : LEASE_US;
+
+	if (result >= 0 && (_expired.load() || hrt_absolute_time() - _feed > startup_limit)) { result = -ETIMEDOUT; }
 
 	if (result < 0) { stop(); return result; }
+
+	const irqstate_t state = enter_critical_section();
+	_feed = hrt_absolute_time();
+	_starting.store(false);
+	leave_critical_section(state);
 
 	return 0;
 }
@@ -134,7 +178,21 @@ void ProtocolTest::watchdog(void *context)
 {
 	auto *self = static_cast<ProtocolTest *>(context);
 
-	if (!self->_expired.load() && hrt_absolute_time() - self->_feed > LEASE_US) {
+#if defined(CONFIG_GPIO_TEST_RECEIVER) && defined(CONFIG_ARCH_HIPRI_INTERRUPT)
+
+	if (self->_mode == Mode::SbusOut && self->_sbus_irq_attached) {
+		up_disable_irq(STM32_IRQ_EXTI95);
+		self->_sbus_clock.advance(getreg16(STM32_TIM8_CNT));
+		up_enable_irq(STM32_IRQ_EXTI95);
+	}
+
+#endif
+
+	// PHY reset/link negotiation can block inside the network driver. No test
+	// datagrams are sent until STARTED; the normal running lease remains 2 s.
+	const hrt_abstime lease = self->_starting.load() && self->_mode == Mode::Ethernet ? 20000000 : LEASE_US;
+
+	if (!self->_expired.load() && hrt_absolute_time() - self->_feed > lease) {
 		self->_expired.store(true);
 		self->disable_outputs();
 	}
@@ -155,9 +213,9 @@ void ProtocolTest::disable_outputs()
 {
 	if (protocol_test::is_adc(_mode)) {
 #ifdef CONFIG_GPIO_TEST_RECEIVER
-		px4_arch_configgpio(ADC_STIMULUS | INPUT);
+		px4_arch_configgpio(adc_stimulus(_mode) | INPUT);
 #else
-		px4_arch_configgpio(ADC_INPUT | INPUT);
+		px4_arch_configgpio((protocol_test::is_adc_3v3(_mode) ? ADC3V3_INPUT : ADC6V6_INPUT) | INPUT);
 #endif
 	}
 
@@ -188,10 +246,13 @@ void ProtocolTest::disable_outputs()
 #endif
 }
 
-void ProtocolTest::stop()
+bool ProtocolTest::stop()
 {
 	hrt_cancel(&_watchdog);
+	hrt_cancel(&_io_sampler);
 	_expired.store(true);
+	_starting.store(false);
+	const bool io_stopped = !_io_needs_cleanup || io_pwm_stop();
 	disable_outputs();
 
 	if (_irq_event_attached) { up_disable_irq(_i2c_event); irq_detach(_i2c_event); _irq_event_attached = false; }
@@ -199,6 +260,8 @@ void ProtocolTest::stop()
 	if (_irq_error_attached) { up_disable_irq(_i2c_error); irq_detach(_i2c_error); _irq_error_attached = false; }
 
 #ifdef CONFIG_GPIO_TEST_RECEIVER
+
+	if (_sbus_irq_attached) { sbus_out_stop(); }
 
 	if (_gpio_scl) {
 		px4_arch_gpiosetevent(_gpio_scl, false, false, false, nullptr, nullptr);
@@ -232,23 +295,25 @@ void ProtocolTest::stop()
 #endif
 	_i2c = _uart = 0;
 	_mode = Mode::None;
+	return io_stopped;
 }
 
 int ProtocolTest::adc_start()
 {
 #ifdef CONFIG_GPIO_TEST_RECEIVER
-	const bool high = _mode == Mode::AdcHigh;
-	const int result = px4_arch_configgpio(ADC_STIMULUS | GPIO_OUTPUT | GPIO_PUSHPULL | GPIO_SPEED_2MHz
+	const bool high = protocol_test::is_adc_high(_mode);
+	const uint32_t pin = adc_stimulus(_mode);
+	const int result = px4_arch_configgpio(pin | GPIO_OUTPUT | GPIO_PUSHPULL | GPIO_SPEED_2MHz
 					       | (high ? GPIO_OUTPUT_SET : GPIO_OUTPUT_CLEAR));
 
-	if (result >= 0 && px4_arch_gpioread(ADC_STIMULUS) != high) {
-		px4_arch_configgpio(ADC_STIMULUS | INPUT);
+	if (result >= 0 && px4_arch_gpioread(pin) != high) {
+		px4_arch_configgpio(pin | INPUT);
 		return -EIO;
 	}
 
 	return result;
 #else
-	const int result = px4_arch_configgpio(GPIO_ADC123_INP12);
+	const int result = px4_arch_configgpio(protocol_test::is_adc_3v3(_mode) ? GPIO_ADC12_INP13 : GPIO_ADC123_INP12);
 
 	if (result < 0) { return result; }
 
@@ -261,11 +326,12 @@ void ProtocolTest::adc_step()
 {
 	_sample.tx++;
 #ifdef CONFIG_GPIO_TEST_RECEIVER
-	const bool high = px4_arch_gpioread(ADC_STIMULUS);
+	const bool high = px4_arch_gpioread(adc_stimulus(_mode));
 	_sample.detail = high ? 3300 : 0;
-	const bool valid = high == (_mode == Mode::AdcHigh);
+	const bool valid = high == protocol_test::is_adc_high(_mode);
 #else
-	const uint32_t raw = px4_arch_adc_sample(SYSTEM_ADC_BASE, ADC6V6_CHANNEL);
+	const unsigned channel = protocol_test::is_adc_3v3(_mode) ? ADC3V3_CHANNEL : ADC6V6_CHANNEL;
+	const uint32_t raw = px4_arch_adc_sample(SYSTEM_ADC_BASE, channel);
 	const uint32_t full = px4_arch_adc_dn_fullcount();
 	const uint32_t reference_mv = static_cast<uint32_t>(px4_arch_adc_reference_v() * 1000.0f + 0.5f);
 	_sample.detail = raw != UINT32_MAX && full > 0 ? static_cast<int>((uint64_t(raw) * reference_mv) / full) : -EIO;
@@ -491,16 +557,16 @@ bool ProtocolTest::uart_write(const uint8_t *data, unsigned length)
 
 	for (unsigned i = 0; i < length; ++i) {
 		while (!(getreg32(_uart + STM32_USART_ISR_OFFSET) & USART_ISR_TXE)) {
-			if (_expired.load() || hrt_absolute_time() > deadline) { return false; }
+			if ((!_io_cleaning && _expired.load()) || hrt_absolute_time() > deadline) { return false; }
 		}
 
-		if (_expired.load()) { return false; }
+		if (!_io_cleaning && _expired.load()) { return false; }
 
 		putreg32(data[i], _uart + STM32_USART_TDR_OFFSET);
 	}
 
 	while (!(getreg32(_uart + STM32_USART_ISR_OFFSET) & USART_ISR_TC)) {
-		if (_expired.load() || hrt_absolute_time() > deadline) { return false; }
+		if ((!_io_cleaning && _expired.load()) || hrt_absolute_time() > deadline) { return false; }
 	}
 
 	return true;
@@ -509,12 +575,29 @@ bool ProtocolTest::uart_write(const uint8_t *data, unsigned length)
 bool ProtocolTest::io_read(uint8_t page, uint8_t offset, uint16_t *data, unsigned count)
 {
 #ifndef CONFIG_GPIO_TEST_RECEIVER
+	const bool pwm_page = (protocol_test::is_io_pwm(_mode) || _mode == Mode::SbusOut || _io_cleaning) &&
+			      (page == PX4IO_PAGE_SETUP || page == PX4IO_PAGE_SERVOS || page == PX4IO_PAGE_DIRECT_PWM || page == PX4IO_PAGE_DISARMED_PWM);
 
-	// Only read packets exist here: no arming, setup, mixer, or actuator writes.
-	if (count > PKT_MAX_REGS || (page != PX4IO_PAGE_CONFIG && page != PX4IO_PAGE_STATUS && page != PX4IO_PAGE_RAW_RC_INPUT)) { return false; }
+	if (!pwm_page && page != PX4IO_PAGE_CONFIG && page != PX4IO_PAGE_STATUS && page != PX4IO_PAGE_RAW_RC_INPUT) { return false; }
+
+	return io_transfer(page, offset, data, count, false);
+#else
+	(void)page; (void)offset; (void)data; (void)count;
+	return false;
+#endif
+}
+
+bool ProtocolTest::io_transfer(uint8_t page, uint8_t offset, uint16_t *data, unsigned count, bool write)
+{
+#ifndef CONFIG_GPIO_TEST_RECEIVER
+
+	if (count > PKT_MAX_REGS || count == 0) { return false; }
 
 	IOPacket packet{};
-	packet.count_code = count | PKT_CODE_READ; packet.page = page; packet.offset = offset;
+	packet.count_code = count | (write ? PKT_CODE_WRITE : PKT_CODE_READ); packet.page = page; packet.offset = offset;
+
+	if (write) { memcpy(packet.regs, data, count * sizeof(uint16_t)); }
+
 	packet.crc = crc_packet(&packet);
 
 	while (getreg32(_uart + STM32_USART_ISR_OFFSET) & USART_ISR_RXNE) { (void)getreg32(_uart + STM32_USART_RDR_OFFSET); }
@@ -528,7 +611,9 @@ bool ProtocolTest::io_read(uint8_t page, uint8_t offset, uint16_t *data, unsigne
 	const hrt_abstime deadline = hrt_absolute_time() + 10000;
 	auto *bytes = reinterpret_cast<uint8_t *>(&packet);
 
-	while (received < length && !_expired.load() && hrt_absolute_time() < deadline) {
+	const unsigned reply_length = write ? 4 : length;
+
+	while (received < reply_length && (_io_cleaning || !_expired.load()) && hrt_absolute_time() < deadline) {
 		const uint32_t status = getreg32(_uart + STM32_USART_ISR_OFFSET);
 
 		if (status & (USART_ISR_ORE | USART_ISR_FE | USART_ISR_NE | USART_ISR_PE)) { return false; }
@@ -538,14 +623,343 @@ bool ProtocolTest::io_read(uint8_t page, uint8_t offset, uint16_t *data, unsigne
 
 	const uint8_t crc = packet.crc; packet.crc = 0;
 
-	if (received != length || PKT_COUNT(packet) != count || PKT_CODE(packet) != PKT_CODE_SUCCESS
+	if (received != reply_length || PKT_COUNT(packet) != (write ? 0 : count) || PKT_CODE(packet) != PKT_CODE_SUCCESS
 	    || packet.page != page || packet.offset != offset || crc_packet(&packet) != crc) { return false; }
 
-	memcpy(data, packet.regs, count * sizeof(uint16_t));
+	if (!write) { memcpy(data, packet.regs, count * sizeof(uint16_t)); }
+
 	return true;
+#else
+	(void)page; (void)offset; (void)data; (void)count; (void)write;
+	return false;
+#endif
+}
+
+bool ProtocolTest::io_write(uint8_t page, uint8_t offset, uint16_t *data, unsigned count)
+{
+#ifndef CONFIG_GPIO_TEST_RECEIVER
+	return (protocol_test::io_pwm_write_allowed(_mode, _token, _io_cleaning, _io_needs_cleanup, _io_saved_rates, page, offset, data, count)
+		|| protocol_test::io_sbus_write_allowed(_io_sbus_cleanup ? Mode::SbusOut : _mode, _io_cleaning, _io_needs_cleanup, _io_saved_features,
+				_io_saved_sbus_rate, page, offset, data, count))
+	       && io_transfer(page, offset, data, count, true);
 #else
 	(void)page; (void)offset; (void)data; (void)count;
 	return false;
+#endif
+}
+
+int ProtocolTest::io_pwm_start()
+{
+#ifdef CONFIG_GPIO_TEST_RECEIVER
+
+	for (const uint32_t pin : IO_RECEIVE_PINS) {
+		if (px4_arch_configgpio(pin | INPUT) < 0) { return -EIO; }
+	}
+
+	hrt_call_every(&_io_sampler, 50, 50, io_pwm_capture, this);
+	return 0;
+#else
+
+	if (uart_start() < 0) { return -EIO; }
+
+	uint16_t version{}, actuators{}, flags{}, arming{}, features{}, disarmed[8] {};
+
+	if (!io_read(PX4IO_PAGE_CONFIG, PX4IO_P_CONFIG_PROTOCOL_VERSION, &version, 1) || version != PX4IO_PROTOCOL_VERSION ||
+	    !io_read(PX4IO_PAGE_CONFIG, PX4IO_P_CONFIG_ACTUATOR_COUNT, &actuators, 1) || actuators != 8 ||
+	    !io_read(PX4IO_PAGE_STATUS, PX4IO_P_STATUS_FLAGS, &flags, 1) ||
+	    !io_read(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_ARMING, &arming, 1) || arming != 0 ||
+	    !io_read(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_FEATURES, &features, 1) ||
+	    (features & ~PX4IO_P_SETUP_FEATURES_ADC_RSSI) != 0 ||
+	    flags & (PX4IO_P_STATUS_FLAGS_OUTPUTS_ARMED | PX4IO_P_STATUS_FLAGS_ARM_SYNC | PX4IO_P_STATUS_FLAGS_RAW_PWM) ||
+	    !io_read(PX4IO_PAGE_DISARMED_PWM, 0, disarmed, 8) ||
+	    !io_read(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_PWM_RATES, _io_saved_rates, 3)) { return -EACCES; }
+
+	for (const auto value : disarmed) { if (value != 0) { return -EACCES; } }
+
+	if (_mode == Mode::SbusOut && !io_read(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_SBUS_RATE, &_io_saved_sbus_rate, 1)) { return -EIO; }
+
+	_io_saved_features = features;
+	_io_sbus_cleanup = _mode == Mode::SbusOut;
+	_io_needs_cleanup = true;
+	uint16_t rates[] {0, static_cast<uint16_t>(protocol_test::io_pwm_hz(_mode)), 200};
+
+	if (!io_write(PX4IO_PAGE_DISARMED_PWM, 0, disarmed, 8)) { return -EIO; }
+
+	if (_mode == Mode::SbusOut) {
+		uint16_t sbus_rate = protocol_test::SBUS_OUT_RATE, sbus_features = PX4IO_P_SETUP_FEATURES_SBUS1_OUT;
+
+		if (!io_write(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_SBUS_RATE, &sbus_rate, 1) ||
+		    !io_write(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_FEATURES, &sbus_features, 1)) { return -EIO; }
+
+	} else if (!io_write(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_PWM_RATES, rates, 3)) { return -EIO; }
+
+	// Only io_pwm_step enables a selected channel after the simulator is ready.
+	return 0;
+#endif
+}
+
+void ProtocolTest::io_pwm_capture(void *context)
+{
+#ifdef CONFIG_GPIO_TEST_RECEIVER
+	auto *self = static_cast<ProtocolTest *>(context);
+
+	if (self->_expired.load()) { return; }
+
+	const hrt_abstime now = hrt_absolute_time();
+
+	if (self->_io_capture_time && now - self->_io_capture_time > 150) { self->_io_timing_errors++; }
+
+	self->_io_capture_time = now;
+
+	for (unsigned i = 0; i < 8; ++i) { self->_io_edges[i].sample(now, px4_arch_gpioread(IO_RECEIVE_PINS[i])); }
+
+#else
+	(void)context;
+#endif
+}
+
+void ProtocolTest::io_pwm_step()
+{
+#ifdef CONFIG_GPIO_TEST_RECEIVER
+	const irqstate_t state = enter_critical_section();
+	const unsigned selected = protocol_test::io_pwm_channel(_mode);
+	const GpioTestEdges edges = _io_edges[selected];
+	const uint32_t timing = _io_timing_errors;
+	bool isolated = true;
+
+	for (unsigned i = 0; i < 8; ++i) { isolated = isolated && (i == selected || _io_edges[i].edges == 0); }
+
+	leave_critical_section(state);
+	_sample.tx++;
+	_sample.detail = edges.frequency_millihz();
+	const unsigned expected = protocol_test::io_pwm_hz(_mode) * 1000;
+	const bool fresh = edges.last_us && hrt_absolute_time() - edges.last_us < 3000000 / protocol_test::io_pwm_hz(_mode);
+	const bool good = edges.edges >= 10 && fresh && isolated && timing == 0 &&
+			  static_cast<unsigned>(_sample.detail) >= expected * 98 / 100 && static_cast<unsigned>(_sample.detail) <= expected * 102 / 100;
+
+	if (!isolated || timing) { _sample.errors++; }
+
+	if (good) { _sample.rx++; }
+
+	_sample.passed = good && _sample.rx >= 10;
+#else
+	uint16_t pwm[8] {}, observed[8] {}, applied[8] {}, flags {}, rates[3] {};
+	pwm[protocol_test::io_pwm_channel(_mode)] = protocol_test::io_pwm_width(_token);
+	_sample.tx++;
+	const bool transferred = io_write(PX4IO_PAGE_DIRECT_PWM, 0, pwm, 8) &&
+				 io_read(PX4IO_PAGE_DIRECT_PWM, 0, observed, 8) && memcmp(pwm, observed, sizeof(pwm)) == 0 &&
+				 io_read(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_PWM_RATES, rates, 3) && rates[0] == 0 && rates[1] == protocol_test::io_pwm_hz(_mode) &&
+				 io_read(PX4IO_PAGE_SERVOS, 0, applied, 8) &&
+				 io_read(PX4IO_PAGE_STATUS, PX4IO_P_STATUS_FLAGS, &flags, 1) && !(flags & PX4IO_P_STATUS_FLAGS_FAILSAFE);
+	const uint16_t running = PX4IO_P_STATUS_FLAGS_OUTPUTS_ARMED | PX4IO_P_STATUS_FLAGS_FMU_OK | PX4IO_P_STATUS_FLAGS_RAW_PWM |
+				 PX4IO_P_STATUS_FLAGS_INIT_OK;
+	const bool good = transferred && (flags & running) == running && memcmp(pwm, applied, sizeof(pwm)) == 0;
+	bool initial_zero = _sample.tx == 1 && transferred;
+
+	for (const auto value : applied) { initial_zero = initial_zero && value == 0; }
+
+	_sample.detail = good ? protocol_test::io_pwm_hz(_mode) * 1000 : initial_zero ? -EAGAIN : -EIO;
+
+	// The first write can precede IO's next mixer tick. Later reads must prove
+	// actual servo values and running state, not only direct-command storage.
+
+	if (good) { _sample.rx++; } else if (!initial_zero) { _sample.errors++; }
+
+	_sample.passed = good && _sample.rx >= 10 && _sample.errors == 0;
+#endif
+}
+
+bool ProtocolTest::io_pwm_stop()
+{
+#ifndef CONFIG_GPIO_TEST_RECEIVER
+	_io_cleaning = true;
+	bool ok = uart_start() >= 0;
+
+	if (_io_sbus_cleanup) {
+		uint16_t features{}, sbus_rate{};
+		ok = io_write(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_FEATURES, &_io_saved_features, 1) && ok;
+		ok = io_write(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_SBUS_RATE, &_io_saved_sbus_rate, 1) && ok;
+		ok = io_read(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_FEATURES, &features, 1) && features == _io_saved_features && ok;
+		ok = io_read(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_SBUS_RATE, &sbus_rate, 1) && sbus_rate == _io_saved_sbus_rate && ok;
+	}
+
+	uint16_t zeros[8] {}, flags{};
+	ok = io_write(PX4IO_PAGE_DIRECT_PWM, 0, zeros, 8) && ok;
+	ok = io_write(PX4IO_PAGE_DISARMED_PWM, 0, zeros, 8) && ok;
+
+	if (io_read(PX4IO_PAGE_STATUS, PX4IO_P_STATUS_FLAGS, &flags, 1) && !(flags & PX4IO_P_STATUS_FLAGS_ARM_SYNC)) {
+		flags &= ~(PX4IO_P_STATUS_FLAGS_RAW_PWM | PX4IO_P_STATUS_FLAGS_INIT_OK | PX4IO_P_STATUS_FLAGS_OUTPUTS_ARMED | PX4IO_P_STATUS_FLAGS_FMU_OK);
+		ok = io_write(PX4IO_PAGE_STATUS, PX4IO_P_STATUS_FLAGS, &flags, 1) && ok;
+
+	} else { ok = false; }
+
+	ok = io_write(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_PWM_RATES, _io_saved_rates, 3) && ok;
+	const hrt_abstime deadline = hrt_absolute_time() + 100000;
+	bool confirmed = false;
+
+	do {
+		usleep(2000); // The IO mixer runs independently of the FMU.
+		uint16_t observed[8] {}, restored_rates[3] {};
+		confirmed = io_read(PX4IO_PAGE_SERVOS, 0, observed, 8) && memcmp(zeros, observed, sizeof(zeros)) == 0 &&
+			    io_read(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_PWM_RATES, restored_rates, 3) &&
+			    memcmp(restored_rates, _io_saved_rates, sizeof(restored_rates)) == 0 &&
+			    io_read(PX4IO_PAGE_STATUS, PX4IO_P_STATUS_FLAGS, &flags, 1) && !(flags & PX4IO_P_STATUS_FLAGS_OUTPUTS_ARMED);
+	} while (!confirmed && hrt_absolute_time() < deadline);
+
+	ok = ok && confirmed;
+	_io_cleaning = false;
+	_io_needs_cleanup = !ok;
+
+	if (ok) { _io_sbus_cleanup = false; }
+
+	return ok;
+#else
+	return true;
+#endif
+}
+
+int ProtocolTest::sbus_out_start()
+{
+#ifdef CONFIG_GPIO_TEST_RECEIVER
+
+	if (px4_arch_configgpio(SBUS_OUT_RECEIVE | INPUT | GPIO_EXTI) < 0) { return -EIO; }
+
+	const irqstate_t state = enter_critical_section();
+#ifdef CONFIG_ARCH_HIPRI_INTERRUPT
+	constexpr uint32_t other_lines = (0x1fu << 5) & ~(1u << 5);
+
+	if (_sbus_owner || (getreg32(STM32_EXTI_CPUIMR1) & other_lines)) {
+		leave_critical_section(state);
+		return -EBUSY;
+	}
+
+#endif
+	_sbus_capture.reset(hrt_absolute_time(), px4_arch_gpioread(SBUS_OUT_RECEIVE));
+	int result = px4_arch_gpiosetevent(SBUS_OUT_RECEIVE, true, true, false, sbus_out_irq, this);
+	_sbus_irq_attached = result >= 0;
+#ifdef CONFIG_ARCH_HIPRI_INTERRUPT
+
+	// This direct vector owns the shared EXTI5..9 IRQ only during SBUS OUT.
+	// Other connector simulators must have released their EXTI lines first.
+	if (result >= 0) {
+		up_disable_irq(STM32_IRQ_EXTI95);
+		_sbus_clock.reset(hrt_absolute_time(), getreg16(STM32_TIM8_CNT));
+		_sbus_owner = this;
+		result = arm_ramvec_attach(STM32_IRQ_EXTI95, sbus_out_fast_irq);
+
+		if (result >= 0) { result = up_prioritize_irq(STM32_IRQ_EXTI95, NVIC_SYSH_HIGH_PRIORITY); }
+
+		if (result >= 0) { up_enable_irq(STM32_IRQ_EXTI95); }
+	}
+
+#endif
+	leave_critical_section(state);
+	return result;
+#else
+	return io_pwm_start();
+#endif
+}
+
+void ProtocolTest::sbus_out_stop()
+{
+#ifdef CONFIG_GPIO_TEST_RECEIVER
+#ifdef CONFIG_ARCH_HIPRI_INTERRUPT
+	up_disable_irq(STM32_IRQ_EXTI95);
+	_sbus_owner = nullptr;
+	arm_ramvec_attach(STM32_IRQ_EXTI95, nullptr);
+	up_prioritize_irq(STM32_IRQ_EXTI95, NVIC_SYSH_PRIORITY_DEFAULT);
+#endif
+	px4_arch_gpiosetevent(SBUS_OUT_RECEIVE, false, false, false, nullptr, nullptr);
+	_sbus_irq_attached = false;
+	px4_arch_configgpio(SBUS_OUT_RECEIVE | INPUT);
+#endif
+}
+
+int ProtocolTest::sbus_out_irq(int, void *, void *context)
+{
+#ifdef CONFIG_GPIO_TEST_RECEIVER
+	auto *self = static_cast<ProtocolTest *>(context);
+
+	if (!self->_expired.load()) {
+		self->_sbus_capture.edge(hrt_absolute_time(), px4_arch_gpioread(SBUS_OUT_RECEIVE));
+	}
+
+#else
+	(void)context;
+#endif
+	return 0;
+}
+
+void ProtocolTest::sbus_out_fast_irq()
+{
+#if defined(CONFIG_GPIO_TEST_RECEIVER) && defined(CONFIG_ARCH_HIPRI_INTERRUPT)
+	constexpr uint32_t line = 1u << 5;
+
+	if (getreg32(STM32_EXTI_CPUPR1) & line) {
+		putreg32(line, STM32_EXTI_CPUPR1);
+		auto *self = _sbus_owner;
+
+		// No RTOS, HRT API, USB or floating-point calls from this direct IRQ.
+		if (self && !self->_expired.load()) {
+			const uint64_t now = self->_sbus_clock.advance(getreg16(STM32_TIM8_CNT));
+			self->_sbus_capture.edge(now, (getreg32(STM32_GPIOG_IDR) & line) != 0);
+		}
+	}
+
+#endif
+}
+
+void ProtocolTest::sbus_out_step()
+{
+#ifdef CONFIG_GPIO_TEST_RECEIVER
+	const irqstate_t state = enter_critical_section();
+#ifdef CONFIG_ARCH_HIPRI_INTERRUPT
+	// BASEPRI deliberately leaves the fast IRQ enabled; mask its NVIC line
+	// explicitly for this short, consistent snapshot and window reset.
+	up_disable_irq(STM32_IRQ_EXTI95);
+#endif
+	const hrt_abstime now = hrt_absolute_time();
+	_sbus_capture.flush(now, px4_arch_gpioread(SBUS_OUT_RECEIVE));
+	const auto stats = _sbus_capture.statistics();
+	_sbus_capture.reset_window();
+#ifdef CONFIG_ARCH_HIPRI_INTERRUPT
+	up_enable_irq(STM32_IRQ_EXTI95);
+#endif
+	leave_critical_section(state);
+	const uint64_t window_us = now - _report;
+	constexpr uint64_t frame_scale = 1000000000ULL; // Frames/us to millihertz.
+	// Allow one boundary frame for quantization, but count over the entire
+	// report period. A short burst with correct frame spacing cannot pass.
+	const bool complete_window = window_us >= REPORT_US &&
+				     (uint64_t(stats.window_frames) + 1) * frame_scale >= protocol_test::SBUS_OUT_MIN_MILLIHZ * window_us &&
+				     uint64_t(stats.window_frames) * frame_scale <= protocol_test::SBUS_OUT_MAX_MILLIHZ * window_us + frame_scale;
+	_sample.tx = stats.frames + stats.errors;
+	_sample.rx = stats.frames;
+	_sample.errors = stats.errors;
+	memcpy(_sample.capture, stats.diagnostic, sizeof(_sample.capture));
+	_sample.detail = stats.frequency_millihz;
+	_sample.passed = complete_window && stats.last_frame_us &&
+			 now - stats.last_frame_us < 100000 && stats.frequency_millihz >= protocol_test::SBUS_OUT_MIN_MILLIHZ &&
+			 stats.frequency_millihz <= protocol_test::SBUS_OUT_MAX_MILLIHZ && stats.errors == 0;
+#else
+	uint16_t zeros[8] {}, observed[8] {}, applied[8] {}, features {}, rate {}, flags {};
+	_sample.tx++;
+	const bool good = io_write(PX4IO_PAGE_DIRECT_PWM, 0, zeros, 8) &&
+			  io_read(PX4IO_PAGE_DIRECT_PWM, 0, observed, 8) && memcmp(zeros, observed, sizeof(zeros)) == 0 &&
+			  io_read(PX4IO_PAGE_SERVOS, 0, applied, 8) && memcmp(zeros, applied, sizeof(zeros)) == 0 &&
+			  io_read(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_FEATURES, &features, 1) && features == PX4IO_P_SETUP_FEATURES_SBUS1_OUT &&
+			  io_read(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_SBUS_RATE, &rate, 1) && rate == protocol_test::SBUS_OUT_RATE &&
+			  io_read(PX4IO_PAGE_STATUS, PX4IO_P_STATUS_FLAGS, &flags, 1) && !(flags & PX4IO_P_STATUS_FLAGS_FAILSAFE);
+	const uint16_t required = PX4IO_P_STATUS_FLAGS_OUTPUTS_ARMED | PX4IO_P_STATUS_FLAGS_FMU_OK | PX4IO_P_STATUS_FLAGS_RAW_PWM |
+				  PX4IO_P_STATUS_FLAGS_INIT_OK;
+	const bool running = good && (flags & required) == required;
+	_sample.detail = running ? protocol_test::SBUS_OUT_RATE * 1000 : -EAGAIN;
+
+	if (running) { _sample.rx++; }
+
+	else if (_sample.tx > 1 || !good) { _sample.errors++; _sample.detail = -EIO; }
+
+	_sample.passed = running && _sample.rx >= 10 && _sample.errors == 0;
 #endif
 }
 
@@ -609,6 +1023,14 @@ bool ProtocolTest::update(ProtocolSample &sample)
 
 		else if (protocol_test::is_adc(_mode)) { adc_step(); }
 
+		else if (protocol_test::is_io_pwm(_mode)) { io_pwm_step(); }
+
+		else if (_mode == Mode::SbusOut) {
+#ifndef CONFIG_GPIO_TEST_RECEIVER
+			sbus_out_step();
+#endif
+		}
+
 		else if (_mode == Mode::Sbus || _mode == Mode::Dsm) { rc_step(); }
 
 		else { network_step(); }
@@ -616,7 +1038,29 @@ bool ProtocolTest::update(ProtocolSample &sample)
 
 	if (_expired.load() || now - _report < REPORT_US) { return false; }
 
+#ifdef CONFIG_GPIO_TEST_RECEIVER
+
+	// Snapshot, validate and reset SBUS reception once per full report period,
+	// even if this update is between two regular STEP_US callbacks.
+	if (_mode == Mode::SbusOut) { sbus_out_step(); }
+
+#endif
 	_report = now; _sample.sequence++; sample = _sample;
+#ifdef CONFIG_GPIO_TEST_RECEIVER
+
+	if (protocol_test::is_io_pwm(_mode)) {
+		const irqstate_t state = enter_critical_section();
+
+		for (auto &edges : _io_edges) {
+			const bool previous = edges.previous;
+			const bool initialized = edges.initialized;
+			edges = {}; edges.previous = previous; edges.initialized = initialized;
+		}
+
+		leave_critical_section(state);
+	}
+
+#endif
 	return true;
 }
 
