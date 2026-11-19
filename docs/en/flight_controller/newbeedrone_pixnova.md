@@ -18,10 +18,9 @@ This flight controller is [manufacturer supported](../flight_controller/autopilo
 
 ## Introduction
 
-The NewBeeDrone PixNova is a professional, modular flight controller designed for high performance.
-It combines an STM32H753 main processor with an independent I/O processor, redundant IMUs, and a heating system that maintains the IMU temperature.
-It is designed for multirotors, fixed-wing aircraft, and other unmanned systems that require high reliability.
-The I/O baseboard provides a broad set of interfaces for connecting external peripherals.
+The NewBeeDrone PixNova is a flight controller based on the FMUv6X standard.
+It uses an STM32H753 main processor, a separate STM32F103 I/O processor, three temperature-controlled IMUs, and a 100 Mbps Ethernet port.
+The I/O baseboard provides connectors for peripherals such as GPS receivers, telemetry radios, and actuators.
 
 ## Key Design Points
 
@@ -77,6 +76,15 @@ The IMU board includes heating resistors to maintain sensor temperature in cold 
 
 - −20 to +85 °C
 
+### Mechanical
+
+- **Weight** 112.33 g
+- **Overall dimensions** 87.70 × 51.30 × 28.91 mm
+- **Inner mounting-hole spacing** 26.5 × 26.5 mm
+- **Outer mounting-hole spacing** 36.7 × 44.0 mm
+
+![NewBeeDrone PixNova dimensions and mounting-hole spacing](../../assets/flight_controller/newbeedrone_pixnova/pixnova_dimensions.jpg)
+
 ## Where To Buy {#store}
 
 Order from [NewBeeDrone](https://newbeedrone.com/collections/all/products/newbeedrone-pixnova-v6x-standard-kit).
@@ -95,34 +103,34 @@ The numbered connectors in the diagram correspond to the table below.
 
 ![NewBeeDrone PixNova connector layout and pin assignments](../../assets/flight_controller/newbeedrone_pixnova/pixnova_pinout.jpg)
 
-| No. | Connector        | Function                                                                           |
-| --- | ---------------- | ---------------------------------------------------------------------------------- |
-| 01  | `I2C3`           | External compass, optical flow, or range sensor; 5 V, SCL3, SDA3, and GND          |
-| 02  | `TELEM1`         | Primary telemetry port on UART7, with RTS/CTS flow control                         |
-| 03  | `TELEM2`         | Secondary telemetry or companion computer port on UART5, with RTS/CTS flow control |
-| 04  | `TELEM3`         | Additional telemetry port on USART2, with RTS/CTS flow control                     |
-| 05  | `I2C3 & UART4`   | Shared connector exposing I2C3 and UART4 for external sensors or a serial receiver |
-| 06  | `GPS2`           | Secondary GPS port with UART8 and I2C2                                             |
-| 07  | `GPS1`           | Primary GPS port with USART1, I2C1, safety switch, and buzzer signals              |
-| 08  | `FMU-Debug`      | FMU SWD debug interface and USART3 serial console                                  |
-| 09  | `IO-Debug`       | I/O processor SWD debug interface                                                  |
-| 10  | `ETH`            | Ethernet interface with TX+/TX− and RX+/RX− pairs                                  |
-| 11  | `PPM RC`         | PPM receiver input                                                                 |
-| 12  | `AD & I/O`       | Analogue and digital I/O, including ADC inputs labelled 3.3 V and 6.6 V            |
-| 13  | `USB`            | USB extension connector                                                            |
-| 14  | `SPI6`           | External SPI connection for sensors or other peripherals                           |
-| 15  | `SBUS OUT`       | SBUS output connection                                                             |
-| 16  | `DSM/SBUS`       | DSM/Spektrum or SBUS receiver input, with RSSI input                               |
-| 17  | `CAN2`           | Second DroneCAN/UAVCAN bus                                                         |
-| 18  | `CAN1`           | First DroneCAN/UAVCAN bus                                                          |
-| 19  | `POWER1`         | Primary power module input                                                         |
-| 20  | `POWER2`         | Backup power module input                                                          |
-| 21  | `FMU/IO`         | 16 PWM outputs: 8 FMU and 8 I/O outputs                                            |
-| 22  | USB Type-C       | USB connection for firmware installation and configuration                         |
-| 23  | GH USB extension | Connection for an external USB extension board                                     |
-| 24  | microSD          | Card slot for flight logs                                                          |
+| No. | Connector      | Function                                                                           |
+| --- | -------------- | ---------------------------------------------------------------------------------- |
+| 01  | `I2C3`         | External compass, optical flow, or range sensor; 5 V, SCL3, SDA3, and GND          |
+| 02  | `TELEM1`       | Primary telemetry port on UART7, with RTS/CTS flow control                         |
+| 03  | `TELEM2`       | Secondary telemetry or companion computer port on UART5, with RTS/CTS flow control |
+| 04  | `TELEM3`       | Additional telemetry port on USART2, with RTS/CTS flow control                     |
+| 05  | `I2C3 & UART4` | Shared connector exposing I2C3 and UART4 for external sensors or a serial receiver |
+| 06  | `GPS2`         | Secondary GPS port with UART8 and I2C2                                             |
+| 07  | `GPS1`         | Primary GPS port with USART1, I2C1, safety switch, and buzzer signals              |
+| 08  | `FMU-Debug`    | FMU SWD debug interface and USART3 serial console                                  |
+| 09  | `IO-Debug`     | I/O processor SWD debug interface                                                  |
+| 10  | `ETH`          | Ethernet interface with TX+/TX− and RX+/RX− pairs                                  |
+| 11  | `PPM RC`       | PPM receiver input                                                                 |
+| 12  | `AD & I/O`     | Analogue and digital I/O, including ADC inputs labelled 3.3 V and 6.6 V            |
+| 13  | `USB`          | GH USB extension connector                                                         |
+| 14  | `SPI6`         | External SPI connection for sensors or other peripherals                           |
+| 15  | `SBUS OUT`     | SBUS output connection                                                             |
+| 16  | `DSM/SBUS`     | DSM/Spektrum or SBUS receiver input, with RSSI input                               |
+| 17  | `CAN2`         | Second DroneCAN/UAVCAN bus                                                         |
+| 18  | `CAN1`         | First DroneCAN/UAVCAN bus                                                          |
+| 19  | `POWER1`       | Primary power module input                                                         |
+| 20  | `POWER2`       | Backup power module input                                                          |
 
-Connectors 21–24 are listed in the manufacturer's interface specifications; the numbered pinout drawing covers connectors 01–20.
+The board also has the following unnumbered interfaces.
+
+- `FMU` and `IO` PWM headers with eight outputs each.
+- USB Type-C port for firmware installation and configuration.
+- microSD card slot for flight logs.
 
 ## Serial Port Mapping
 
@@ -155,14 +163,15 @@ Follow [CRSF Telemetry](../telemetry/crsf_telemetry.md) for wiring and the requi
 
 ### Input Ratings
 
-| Input                | Manufacturer Rating |
-| -------------------- | ------------------- |
-| `POWER1` / `POWER2`  | 3.8–5.8 V           |
-| USB                  | 4.75–5.25 V         |
-| PWM/servo power rail | 0–12 V              |
+| Input                | Voltage Rating             | Recommended Supply            |
+| -------------------- | -------------------------- | ----------------------------- |
+| `POWER1` / `POWER2`  | 3.8–5.8 V protection range | Regulated 5 V nominal         |
+| USB                  | 4.75–5.25 V                | 5 V nominal                   |
+| PWM/servo power rail | 0–12 V                     | Match the connected actuators |
 
-The PWM/servo rail rating is separate from the flight controller supply rating.
-Select a rail voltage that matches the connected actuators; the 12 V rating does not apply to the PWM signal pins.
+Both `POWER1` and `POWER2` expose I2C data (`SDA`) and clock (`SCL`) pins for digital power module telemetry.
+Power the PWM/servo rail separately from the flight controller supply.
+Apply the actuator supply voltage only to the PWM/servo rail power pins.
 
 ### Power Protection
 
@@ -172,12 +181,16 @@ The baseboard provides overvoltage protection at 5.85 V and undervoltage protect
 `TELEM1` and `GPS2` share a 1.5 A peripheral current limit.
 The remaining expansion interfaces share a separate 1.5 A current limit.
 
-## Dimensions
+## LEDs And Buttons
 
-The overall dimensions are 87.70 × 51.30 × 28.91 mm, as shown in the manufacturer's drawing.
-The drawing also gives the mounting-hole positions and spacing in millimetres.
+Use a small tool to press and hold the recessed `BOOT` button for 2 seconds to enter firmware programming mode.
 
-![NewBeeDrone PixNova dimensions and mounting-hole spacing](../../assets/flight_controller/newbeedrone_pixnova/pixnova_dimensions.jpg)
+| LED     | Function                                                                                                   |
+| ------- | ---------------------------------------------------------------------------------------------------------- |
+| `IO`    | Blinks as a heartbeat while the I/O firmware is running.                                                   |
+| `AMBER` | Stays on if I/O initialization fails and blinks when the I/O processor is receiving no input from the FMU. |
+| `PWR`   | Indicates that the flight controller is powered.                                                           |
+| `LINK`  | Indicates that an Ethernet link is established.                                                            |
 
 ## Peripherals
 
