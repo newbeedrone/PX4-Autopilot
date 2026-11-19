@@ -183,14 +183,18 @@ The remaining expansion interfaces share a separate 1.5 A current limit.
 
 ## LEDs And Buttons
 
-Use a small tool to press and hold the recessed `BOOT` button for 2 seconds to enter firmware programming mode.
+### Status LEDs
 
-| LED     | Function                                                                                                   |
-| ------- | ---------------------------------------------------------------------------------------------------------- |
-| `IO`    | Blinks as a heartbeat while the I/O firmware is running.                                                   |
-| `AMBER` | Stays on if I/O initialization fails and blinks when the I/O processor is receiving no input from the FMU. |
-| `PWR`   | Indicates that the flight controller is powered.                                                           |
-| `LINK`  | Indicates that an Ethernet link is established.                                                            |
+| Label | Indication                                                                                     |
+| ----- | ---------------------------------------------------------------------------------------------- |
+| IO    | Blinks while the I/O firmware is running.                                                      |
+| AMBER | Solid if the I/O processor fails to initialize. Blinks when it receives no input from the FMU. |
+| PWR   | Lights when the flight controller is powered.                                                  |
+| LINK  | Indicates an established Ethernet link.                                                        |
+
+### BOOT Button
+
+Use a small tool to press and hold the recessed button for 2 seconds to enter firmware programming mode.
 
 ## Peripherals
 
@@ -210,8 +214,6 @@ To [build PX4](../dev_setup/building_px4.md) for this target from source:
 ```sh
 make newbeedrone_pixnova_default
 ```
-
-Install the resulting `.px4` file using the [custom firmware option](../config/firmware.md#custom) in _QGroundControl_.
 
 ## Debug Port {#debug_port}
 
