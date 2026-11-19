@@ -167,7 +167,7 @@ Follow [CRSF Telemetry](../telemetry/crsf_telemetry.md) for wiring and the requi
 | -------------------- | -------------------------- | ----------------------------- |
 | `POWER1` / `POWER2`  | 3.8–5.8 V protection range | Regulated 5 V nominal         |
 | USB                  | 4.75–5.25 V                | 5 V nominal                   |
-| PWM/servo power rail | 0–12 V                     | Match the connected actuators |
+| PWM/servo power rail | 0–36 V                     | Match the connected actuators |
 
 Both `POWER1` and `POWER2` expose I2C data (`SDA`) and clock (`SCL`) pins for digital power module telemetry.
 Power the PWM/servo rail separately from the flight controller supply.
