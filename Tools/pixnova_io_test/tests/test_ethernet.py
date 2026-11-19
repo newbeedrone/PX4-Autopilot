@@ -112,3 +112,15 @@ class EthernetTests(unittest.TestCase):
         self.case.sample(run, "source", 2, detail=0)
         peer.pump(run, 2)
         self.assertEqual(run.result.status, "FAIL")
+
+    def test_socket_error_fails_ethernet_and_waits_for_stop_confirmation(self):
+        for method, operation in (("sendto", "send"), ("recvfrom", "receive")):
+            with self.subTest(operation=operation):
+                run, peer, sock = self.make()
+                self.case.sample(run, "source", 1, detail=1)
+                with patch.object(sock, method, side_effect=OSError("Network down")):
+                    peer.pump(run, 1)
+                self.assertEqual(self.case.sent[-1], ("source", "STOP"))
+                self.case.confirm_stop(run)
+                self.assertEqual(run.phase, "FAILED")
+                self.assertIn(f"Ethernet {operation} failed: Network down", run.result.reason)

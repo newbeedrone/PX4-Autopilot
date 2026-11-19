@@ -31,6 +31,9 @@ def check():
         assert time.monotonic() < deadline, (stage, panel.status.get())
         if stage == "INITIAL" and panel.guid() and not panel.worker.busy:
             station.stop()
+            stage = "WAIT_STOP"
+        elif stage == "WAIT_STOP" and station.phase == "STOPPED":
+            assert station.gpio_stop.confirmed == {"source", "probe"}
             station.view.select_connector_group("Ethernet")
             assert click(panel, "Configure IP")
             stage = "CONFIGURED"

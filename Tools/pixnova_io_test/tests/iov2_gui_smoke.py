@@ -20,6 +20,9 @@ def check():
         assert time.monotonic() < deadline, "IOV2 GUI test timed out"
         if stage == "START":
             station.stop()
+            stage = "WAIT_STOP"
+        elif stage == "WAIT_STOP" and station.phase == "STOPPED":
+            assert station.gpio_stop.confirmed == {"source", "probe"}
             station.view.filter(None)
             assert station.view.map.find_withtag("protocol-pin-fill:IO_PWM1")
             assert station.view.map.find_withtag("protocol-pin-fill:SBUS_OUT:2")

@@ -40,6 +40,9 @@ class EthernetPeer:
                 data, peer = self.socket.recvfrom(128)
             except BlockingIOError:
                 break
+            except OSError as error:
+                run.fail(f"Ethernet receive failed: {error}")
+                return
             sequence = int.from_bytes(data[8:12], "little")
             if peer != self.remote or len(data) != 32 or sequence not in self.pending:
                 run.fail("Unexpected or replayed Ethernet response")
@@ -51,7 +54,12 @@ class EthernetPeer:
         if now - self.last_send >= .05:
             self.sequence += 1
             data = packet("ETH", run.token, self.sequence)
-            if self.socket.sendto(data, self.remote) != len(data):
+            try:
+                sent = self.socket.sendto(data, self.remote)
+            except OSError as error:
+                run.fail(f"Ethernet send failed: {error}")
+                return
+            if sent != len(data):
                 run.fail("Incomplete Ethernet datagram write")
                 return
             self.pending[self.sequence] = now

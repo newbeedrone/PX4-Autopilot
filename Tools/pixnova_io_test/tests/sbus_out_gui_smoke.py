@@ -26,6 +26,9 @@ def check():
         assert time.monotonic() < deadline, (stage, station.state.get())
         if stage == "START":
             station.stop()
+            stage = "WAIT_STOP"
+        elif stage == "WAIT_STOP" and station.phase == "STOPPED":
+            assert station.gpio_stop.confirmed == {"source", "probe"}
             root.geometry("1180x760")
             root.update_idletasks()
             for frame, title, count in station.view.nav_items.values():

@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from dashboard import load_connectors
+from dashboard import RED, load_connectors
 from generate_profile import load_profile
 from model import Assessment
 from app import Station
@@ -481,6 +481,16 @@ class StationTests(unittest.TestCase):
         self.assertIn("interfaces FAIL: 42/43", station.state.value)
         self.assertIn("10/10 I2C/ADC checks", station.state.value)
         self.assertFalse(station.report_snapshot()["external_suite_passed"])
+
+    def test_stop_retains_finalization_failure_in_the_completed_status(self):
+        station = self.completed_controller()
+        self.assertTrue(station.completed_report["all_passed"])
+        station.completed_report["post_test"] = {"status": "FAILED", "error": "Flash CRC mismatch"}
+        station.state_label = Mock()
+        station.stop()
+        self.assertEqual(station.phase, "COMPLETE")
+        self.assertIn("Finish failed: Flash CRC mismatch", station.state.get())
+        station.state_label.configure.assert_called_once_with(foreground=RED)
 
     def test_completed_measurements_survive_usb_disconnect_and_late_frames(self):
         station = self.completed_controller()

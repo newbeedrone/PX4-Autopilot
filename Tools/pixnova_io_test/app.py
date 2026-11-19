@@ -375,6 +375,8 @@ class Station:
         probe = getattr(self.links.get("probe"), "device", self.probe_port.get())
         self.finish_worker = CompletionWorker(self.completed_report, directory, image, source, probe, self.demo)
         self.phase = "FINISHING"
+        self.state.set("Measurements finished · saving CSV before firmware restoration")
+        self.state_label.configure(foreground=MUTED)
         self.generation += 1
         for link in self.links.values(): link.close()
         for link in self.links.values(): link.join(timeout=.5)
@@ -394,12 +396,8 @@ class Station:
             if event.get("done"):
                 self.completed_report = event["report"]
                 self.phase = "COMPLETE"
-                message = ("Finish failed: " + event["error"] if "error" in event else
-                           "CSV saved · " + ("DEMO; no hardware flashed" if self.demo else "normal firmware restored; CRC and reboot confirmed"))
-                self.show_completion()
-                self.state.set(self.state.get() + " · " + message)
+                message = self.show_completion()
                 self.view.completion.status.set(message + " · " + event["csv"])
-                if "error" in event: self.state_label.configure(foreground=RED)
                 self.finish_worker = None
 
     def start_i2c(self, mode=None):
@@ -572,10 +570,20 @@ class Station:
             io_passed = sum(report["connector_tests"].get(mode, {}).get("status") == "PASS" for mode in IO_MODES)
             text += f" · IOV2 {io_passed}/8 · SBUS OUT {'PASS' if report['sbus_out_passed'] else 'FAIL'} · Ethernet {'PASS' if report['ethernet_passed'] else 'FAIL'}"
             text += " · CAN " + ("PASS" if report.get("can_passed") else "FAIL")
+        post = report.get("post_test", {})
+        finish_failed = post.get("status") == "FAILED"
+        message = ""
+        if finish_failed:
+            message = "Finish failed: " + post["error"]
+        elif post.get("status") == "COMPLETE":
+            message = "CSV saved · " + ("DEMO; no hardware flashed" if self.demo else "normal firmware restored; CRC and reboot confirmed")
+        if message:
+            text += " · " + message
         if notice:
             text += f" · {notice}; completed results retained"
         self.state.set(text)
-        self.state_label.configure(foreground=GREEN if report["all_passed"] else RED)
+        self.state_label.configure(foreground=GREEN if report["all_passed"] and not finish_failed else RED)
+        return message
 
     def adc_summary(self, channel_id):
         modes = ADC_CHANNEL_MODES[channel_id]
