@@ -66,7 +66,7 @@
         "source"
       ],
       "path": "PixNova ETH 192.168.77.2 \u2194 PC Ethernet 192.168.77.1 \u00b7 UDP 14570",
-      "wiring": "Disconnect ETH from fixture P2. Use the correct PixNova Ethernet adapter and a real PC Ethernet interface. Select PC Ethernet in this GUI; Configure IP or Start selected test adds the temporary 192.168.77.1/24 address while retaining DHCP, existing IP, gateway and DNS. Accept the Windows administrator prompt if requested. Restore removes only this application's test address. USB remains connected for control.",
+      "wiring": "Disconnect ETH from fixture P2. Use the correct PixNova Ethernet adapter and a real PC Ethernet interface. Select PC Ethernet in this GUI. If the test IP is missing, click Configure IP to add 192.168.77.1/24 and approve the Windows administrator prompt. Tests reuse an existing test IP. DHCP, existing IP, gateway and DNS are retained. Restore removes only this application's test address. USB remains connected for control.",
       "criterion": "Physical PHY link plus fresh bidirectional, token/sequence/CRC-checked UDP request/response packets. Both the PC and flight controller must verify them."
     },
     {

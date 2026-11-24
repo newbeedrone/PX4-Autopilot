@@ -68,9 +68,22 @@ class EthernetTests(unittest.TestCase):
         peer.pump(run, 2)
         self.assertEqual(len(sock.sent), 1)
 
+    def test_replies_already_queued_are_read_before_timeout_after_gui_delay(self):
+        run, peer, sock = self.make()
+        sock.echo = True
+        self.case.sample(run, "source", 1, detail=1)
+        peer.pump(run, 1)
+        peer.pump(run, 2.1)
+        self.assertEqual(run.phase, "RUNNING")
+        self.assertEqual(run.host_rx, 1)
+        self.assertEqual(list(peer.pending), [2])
+
     def test_bidirectional_packets_and_stop_confirmation_are_required(self):
-        run, peer, sock = self.make(); sock.echo = True
-        for step in range(20, 121):
+        run, peer, sock = self.make()
+        self.case.sample(run, "source", 1, detail=1)
+        peer.pump(run, 1)  # The first probe receives no reply.
+        sock.echo = True
+        for step in range(21, 121):
             now = step / 20
             if step % 20 == 0:
                 self.case.sample(run, "source", step//20, detail=1)
@@ -86,6 +99,22 @@ class EthernetTests(unittest.TestCase):
         self.assertEqual(run.result.status, "PASS")
         peer.close()
         self.assertTrue(sock.closed)
+
+    def test_late_startup_reply_does_not_hide_later_packet_loss(self):
+        run, peer, sock = self.make()
+        self.case.sample(run, "source", 1, detail=1)
+        peer.pump(run, 1)
+        peer.pump(run, 1.1)
+        sock.responses.append((packet("ETH", run.token, 2, True), peer.remote))
+        peer.pump(run, 1.2)
+        self.assertEqual(list(peer.pending), [3])
+        sock.responses.append((packet("ETH", run.token, 1, True), peer.remote))
+        peer.pump(run, 2.05)
+        self.assertEqual(run.phase, "RUNNING")
+        self.assertEqual(run.host_rx, 1)
+        peer.pump(run, 2.21)
+        self.assertEqual(run.result.status, "FAIL")
+        self.assertIn("Ethernet reply timed out (sequence 3,", run.result.reason)
 
     def test_corrupt_or_replayed_reply_stops_without_sending_another_packet(self):
         for corrupt in (True, False):
@@ -106,6 +135,7 @@ class EthernetTests(unittest.TestCase):
         peer.pump(run, 1)
         peer.pump(run, 2.01)
         self.assertEqual(run.result.status, "FAIL")
+        self.assertIn("sequence 1, PC sent 1, verified 0", run.result.reason)
         run, peer, sock = self.make(); sock.echo = True
         self.case.sample(run, "source", 1, detail=1)
         peer.pump(run, 1); peer.pump(run, 1.1)

@@ -15,7 +15,7 @@ deadline = time.monotonic() + 20
 
 def button(parent):
     for widget in parent.winfo_children():
-        if isinstance(widget, Action) and widget.text == "Test SBUS OUT": return widget
+        if isinstance(widget, Action) and widget.text == "Retest SBUS OUT": return widget
         match = button(widget)
         if match: return match
 

@@ -191,7 +191,16 @@ class NetworkSettings:
         owned = self.journal(guid)
         correct = bool(address and address["prefix"] == TEST_PREFIX)
         ready = correct and address["dad"] == 4 and adapter["status"] == "Up"
-        message = "Test IP ready" if ready else "Test IP assigned; waiting for cable/address verification" if correct else "Test IP not configured"
+        if ready:
+            message = "Test IP ready"
+        elif not address:
+            message = "Test IP not configured"
+        elif not correct:
+            message = f"Test IP has /{address['prefix']}; expected /{TEST_PREFIX}"
+        elif address["dad"] in (0, 2, 3):
+            message = "Test IP is unusable. Check for an address conflict"
+        else:
+            message = "Test IP assigned; waiting for cable/address verification"
         return {"adapter": adapter, "address": address, "ready": ready,
                 "owned": bool(owned.get("owned")), "message": message}
 
@@ -290,7 +299,7 @@ class NetworkSettings:
         return elevated_change(action, guid, self.state_dir)
 
 
-def elevated_change(action, guid, state_dir):
+def run_elevated(args):
     """Use the standard Windows permission prompt; the GUI remains unprivileged."""
     from ctypes import wintypes as W
     class ExecuteInfo(C.Structure):
@@ -302,24 +311,32 @@ def elevated_change(action, guid, state_dir):
     shell.ShellExecuteExW.argtypes, shell.ShellExecuteExW.restype = [C.POINTER(ExecuteInfo)], W.BOOL
     kernel.WaitForSingleObject.argtypes, kernel.WaitForSingleObject.restype = [W.HANDLE, W.DWORD], W.DWORD
     kernel.CloseHandle.argtypes = [W.HANDLE]
+    info = ExecuteInfo()
+    info.size, info.mask, info.verb, info.file = C.sizeof(info), 0x40, "runas", sys.executable
+    info.parameters, info.directory, info.show = subprocess.list2cmdline(args), tempfile.gettempdir(), 0
+    if not shell.ShellExecuteExW(C.byref(info)):
+        code = C.get_last_error()
+        raise RuntimeError("Windows permission was cancelled; network settings retained" if code == 1223 else C.FormatError(code))
+    try:
+        while True:
+            result = kernel.WaitForSingleObject(info.process, 500)
+            if result == 0: break
+            if result != 258: raise OSError(C.get_last_error(), "Cannot wait for the network helper")
+    finally:
+        kernel.CloseHandle(info.process)
+
+
+def elevated_change(action, guid, state_dir):
     with tempfile.TemporaryDirectory(prefix="pixnova-network-") as folder:
         result_path = Path(folder) / "result.json"
         args = [str(Path(__file__).resolve()), "--action", action, "--guid", guid, "--state-dir", str(state_dir), "--result", str(result_path)]
-        info = ExecuteInfo()
-        info.size, info.mask, info.verb, info.file = C.sizeof(info), 0x40, "runas", sys.executable
-        info.parameters, info.directory, info.show = subprocess.list2cmdline(args), tempfile.gettempdir(), 0
-        if not shell.ShellExecuteExW(C.byref(info)):
-            code = C.get_last_error()
-            raise RuntimeError("Windows permission was cancelled; network settings retained" if code == 1223 else C.FormatError(code))
-        try:
-            while True:
-                result = kernel.WaitForSingleObject(info.process, 500)
-                if result == 0: break
-                if result != 258: raise OSError(C.get_last_error(), "Cannot wait for the network helper")
-        finally:
-            kernel.CloseHandle(info.process)
-        if not result_path.exists(): raise RuntimeError("Administrator helper did not return a result; refresh adapter status")
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+        # Retain the GUI's file ownership and read handle across the privilege boundary.
+        with result_path.open("w+", encoding="utf-8") as stream:
+            run_elevated(args)
+            try:
+                result = json.load(stream)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                raise RuntimeError("Administrator helper did not return a readable result; refresh adapter status") from None
         if not result["ok"]: raise RuntimeError(result["error"])
         return result["value"]
 
@@ -347,19 +364,24 @@ class NetworkWorker:
         return event
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--action", choices=("configure", "restore"), required=True)
     parser.add_argument("--guid", required=True)
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--result", type=Path, required=True)
-    args = parser.parse_args()
-    try:
-        settings = NetworkSettings(args.state_dir)
-        value = settings.configure_local(args.guid) if args.action == "configure" else settings.restore_local(args.guid)
-        response = {"ok": True, "value": value}
-    except Exception as error:
-        response = {"ok": False, "error": str(error)}
-    temporary = args.result.with_suffix(".tmp")
-    temporary.write_text(json.dumps(response), encoding="utf-8")
-    os.replace(temporary, args.result)
+    args = parser.parse_args(argv)
+    # Open the parent's existing response file before modifying Windows settings.
+    with args.result.open("r+", encoding="utf-8") as stream:
+        try:
+            settings = NetworkSettings(args.state_dir)
+            value = settings.configure_local(args.guid) if args.action == "configure" else settings.restore_local(args.guid)
+            response = {"ok": True, "value": value}
+        except Exception as error:
+            response = {"ok": False, "error": str(error)}
+        json.dump(response, stream)
+        stream.truncate()
+
+
+if __name__ == "__main__":
+    main()

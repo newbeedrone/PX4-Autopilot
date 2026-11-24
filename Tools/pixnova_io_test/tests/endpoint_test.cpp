@@ -140,6 +140,23 @@ int main(int argc, char *argv[])
 			assert(failed.find("requested") == std::string::npos);
 		}
 
+		{
+			Fixture f;
+			test_protocol_stop_ok = false;
+			assert(f.command("CHECK").find("cleanup_failed") != std::string::npos);
+			assert(f.command("START").find("self_check_required") != std::string::npos);
+			assert(f.protocol_check().find("cleanup_failed") != std::string::npos);
+			char command[160] {};
+			snprintf(command, sizeof(command), "PROTO %s %s I2C3 12345678", SESSION, GPIO_TEST_PROFILE_SHA);
+			f.endpoint.command(command);
+			assert(!f.endpoint._protocol.active());
+			f.inputs_only();
+
+			test_protocol_stop_ok = true;
+			assert(f.command("CHECK").find("\"type\":\"checked\"") != std::string::npos);
+			assert(f.command("START").find("\"type\":\"started\"") != std::string::npos);
+		}
+
 		for (bool checked : {false, true}) {
 			Fixture f;
 

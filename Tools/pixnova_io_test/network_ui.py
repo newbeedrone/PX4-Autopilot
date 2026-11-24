@@ -3,7 +3,7 @@ import tkinter as tk
 from tkinter import ttk
 
 from dashboard import Action, label, BLUE, GREEN, RED, MUTED, MONO
-from network_config import NetworkSettings, NetworkWorker, TEST_ADDRESS
+from network_config import NetworkSettings, NetworkWorker, TEST_ADDRESS, TEST_PREFIX
 
 
 class DemoNetwork:
@@ -133,10 +133,10 @@ class NetworkPanel(tk.Frame):
                         self.cancel_test()
                         try: callback(self.backend.ready_index(self.guid()))
                         except (ValueError, OSError, RuntimeError) as error: self.display(str(error), True)
-                    elif event["action"] == "status":
-                        self.change("configure")
+                    elif self.last_status.get("address") is None:
+                        self.display(f"Test IP {TEST_ADDRESS}/{TEST_PREFIX} is missing. Click Configure IP to continue.")
                     else:
-                        self.cancel_test()
+                        self.display(f"PC link {adapter['status']} · {self.last_status['message']}. Click Refresh to recheck.")
         self.after_id = self.root.after(100, self.poll)
 
     def snapshot(self):

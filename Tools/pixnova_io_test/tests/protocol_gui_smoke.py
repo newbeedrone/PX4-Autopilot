@@ -26,14 +26,18 @@ def check():
     global stage
     try:
         assert time.monotonic() < deadline, "Protocol GUI test timed out"
-        if stage == "OPEN":
-            station.open_protocols()
-            child = station.protocol_window
+        if stage == "OPEN" and station.phase == "RUNNING":
+            button = next(w for w in widgets(root) if isinstance(w, Action) and w.text == "Protocols")
+            button.event_generate("<Button-1>")
+            assert station.phase == "STOPPING_GPIO"
+            stage = "WAIT_HANDOFF"
+        child = getattr(station, "protocol_window", None)
+        if stage == "WAIT_HANDOFF" and child is not None:
+            assert station.gpio_stop.confirmed == {"source", "probe"}
             child.connect()
             child.mode.set("ADC3V3_HIGH")
             child.start()
             stage = "CANCEL"
-        child = station.protocol_window
         if stage == "CANCEL" and child.run.phase == "RUNNING":
             stop = next(w for w in widgets(root) if isinstance(w, Action) and w.text == "■  Stop")
             stop.event_generate("<Button-1>")

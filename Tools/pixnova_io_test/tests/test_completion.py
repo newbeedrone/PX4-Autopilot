@@ -14,7 +14,7 @@ from unittest.mock import Mock, patch
 import zlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from completion import CompletionPanel, FlightImage, CompletionWorker, PreparationWorker, expected_serial, program_verified, save_csv
+from completion import CompletionPanel, FlightImage, CompletionWorker, FirmwareUpdateWorker, PreparationWorker, expected_serial, program_verified, save_csv
 from workflow import GpioSequence, GpioStop
 from model import Assessment
 from protocol_model import ProtocolRun
@@ -155,13 +155,33 @@ class CompletionTests(unittest.TestCase):
         restore.assert_not_called()
         self.assertEqual(worker.report["post_test"]["restoration"]["status"], "DEMO")
 
-    def test_normal_firmware_must_be_chosen_before_start(self):
+    def test_no_firmware_selection_prepares_and_saves_measurement_only_csv(self):
         panel = CompletionPanel.__new__(CompletionPanel)
         panel.directory, panel.path = Mock(), Mock()
+        panel.status = Mock()
         panel.directory.get.return_value = str(self.folder)
         panel.path.get.return_value = ""
-        with self.assertRaisesRegex(ValueError, "Choose normal flight firmware"):
-            panel.prepare(False)
+        image, directory = panel.prepare(False)
+        self.assertIsNone(image)
+        worker = CompletionWorker(self.report | {"all_passed": True}, directory, image, "COM9", "COM143")
+        with patch("completion.restore_usb") as restore:
+            worker.run()
+        restore.assert_not_called()
+        self.assertEqual(worker.report["post_test"]["restoration"]["status"], "SKIPPED")
+        with Path(worker.report["post_test"]["csv"]).open(encoding="utf-8-sig", newline="") as stream:
+            summary = next(row for row in csv.DictReader(stream) if row["record_type"] == "summary")
+        self.assertEqual(summary["status"], "PASS")
+        self.assertEqual(summary["finalization_status"], "PASS")
+
+    def test_independent_update_reuses_usb_restore_without_starting_tests_or_saving_csv(self):
+        image = FlightImage(self.path)
+        source_id = self.report["devices"]["source"]["device_id"]
+        worker = FirmwareUpdateWorker(image, "COM9", "COM143", source_id)
+        with patch("completion.restore_usb") as restore, patch("completion.save_csv") as save:
+            worker.run()
+        self.assertEqual(restore.call_args.args[:4], (image, "COM9", "COM143", source_id))
+        self.assertTrue(worker.events.get_nowait()["success"])
+        save.assert_not_called()
 
     def test_final_csv_update_failure_retains_first_csv_and_restoration_evidence(self):
         worker = CompletionWorker(self.report, self.folder, FlightImage(self.path), "COM9", "COM143")
@@ -308,6 +328,52 @@ class SequenceTests(unittest.TestCase):
         self.assertEqual(station.finish_plan, plan)
         self.assertTrue(station.commands)
 
+    def test_blank_firmware_allows_real_test_even_without_restore_capability(self):
+        station = self.case.make_controller()
+        station.capabilities = {role: {"i2c_simulators": 2, "adc_levels": 2, "io_pwm": 1, "sbus_out": 1, "session_stop": 1}
+                                for role in ("source", "probe")}
+        station.view = Mock(network_panel=None)
+        station.view.completion.selection.return_value = ("", str(self.folder), False)
+        with patch("app.PreparationWorker") as worker:
+            station.start_full_test()
+        worker.assert_called_once_with("", str(self.folder), False)
+        self.assertEqual(station.phase, "PREPARING")
+        self.assertFalse(station.commands)
+
+    def test_manual_update_button_uses_selected_path_and_requires_idle_outputs(self):
+        station = self.case.make_controller()
+        station.closing = False
+        station.capabilities["source"] = {"usb_restore": 1}
+        station.view = Mock()
+        station.view.network_panel.changing = False
+        station.view.completion.path.get.return_value = "normal.px4"
+        with patch.object(station, "prepare_selection") as prepare:
+            station.phase = "RUNNING"
+            station.update_firmware()
+            prepare.assert_not_called()
+            station.phase = "READY"
+            station.update_firmware()
+            prepare.assert_called_once_with(("normal.px4", None, False), manual=True)
+
+    def test_manual_update_confirmation_uses_the_verified_serial_owner(self):
+        station = self.case.make_controller()
+        station.closing = False
+        station.root = Mock()
+        station.view = Mock()
+        station.view.network_panel.changing = False
+        station.capabilities["source"] = {"usb_restore": 1}
+        source_id = "a" * 32
+        station.identities["source"] = {"device_id": source_id}
+        station.links = {"source": Mock(device="COM9"), "probe": Mock(device="COM143")}
+        image = Mock(path=Path("normal.px4"))
+        with patch("app.messagebox.askokcancel", side_effect=(False, True)), patch("app.FirmwareUpdateWorker") as worker:
+            station.begin_firmware_update(image)
+            worker.assert_not_called()
+            station.begin_firmware_update(image)
+            worker.assert_called_once_with(image, "COM9", "COM143", source_id, False)
+            worker.return_value.start.assert_called_once()
+        self.assertEqual(station.phase, "FINISHING")
+
     def test_cancelled_or_disconnected_preparation_cannot_start_later(self):
         for disconnect in (False, True):
             station, worker = self.preparing_station()
@@ -337,11 +403,12 @@ class SequenceTests(unittest.TestCase):
         station.poll_preparation()
         self.assertFalse(station.commands)
 
-    def test_start_with_flight_usb_offline_displays_the_reason(self):
+    def test_start_before_usb_verification_explains_how_to_connect(self):
         station = self.case.make_controller()
         station.hello.pop("source")
         station.start_full_test()
-        self.assertIn("PixNova USB offline", station.state.get())
+        self.assertIn("USB not verified for PixNova", station.state.get())
+        self.assertIn("Refresh, select the current ports, then click Connect USB", station.state.get())
         self.assertFalse(station.commands)
 
     def test_gpio_requires_both_current_stop_acknowledgements(self):
@@ -441,6 +508,54 @@ class SequenceTests(unittest.TestCase):
         self.assertEqual(station.gpio_sequence.groups, ["GPS1", "SPI6"])
         self.assertEqual(station.suite_stage, "gpio_only")
 
+    def test_gpio_retest_merges_only_selected_results_after_both_stop_replies(self):
+        station = self.gpio_station()
+        station.phase, station.suite_stage, station.suite_active = "WAITING_IOV2", "fmu", True
+        station.gpio_sequence = sequence = GpioSequence(station.profile)
+        ppm = sequence.indices["PPM"][0]
+        station.assessment.results[0].status = "PASS"
+        station.assessment.results[ppm].status = "FAIL"
+        station.i2c_results = {"CAN": {"status": "PASS"}}
+        station.gpio_snapshot = station.report_snapshot()
+        sequence.completed["PPM"] = [{"status": "FAIL"}]
+        station.finish_plan = (None, self.folder)
+        station.retest_gpio("PPM")
+        self.assertEqual(station.phase, "CHECKING")
+        self.assertEqual(station.gpio_sequence.groups, ["PPM"])
+        self.assertEqual(station.assessment.results[0].status, "PASS")
+        self.assertTrue(all(command.startswith("CHECK ") for _, command in station.commands))
+        station.phase = "RUNNING"
+        station.assessment.results[ppm].status = "PASS"
+        station.advance_gpio_sequence(time.monotonic())
+        self.acknowledge_gpio(station, ("source",))
+        self.assertEqual(station.phase, "STOPPING_GPIO")
+        self.assertEqual(sequence.completed["PPM"][0]["status"], "FAIL")
+        self.acknowledge_gpio(station, ("probe",))
+        self.assertEqual(station.phase, "WAITING_IOV2")
+        self.assertIs(station.gpio_sequence, sequence)
+        self.assertEqual(station.report_snapshot()["channels"][ppm]["status"], "PASS")
+        self.assertEqual(station.report_snapshot()["channels"][0]["status"], "PASS")
+        self.assertEqual(station.i2c_results["CAN"]["status"], "PASS")
+        self.assertEqual(station.finish_plan, (None, self.folder))
+        self.assertIn("Confirm IOV2 wiring", station.state.get())
+
+    def test_gpio_retest_with_unconfirmed_shutdown_keeps_earlier_results(self):
+        station = self.gpio_station()
+        station.phase, station.suite_stage = "COMPLETE", None
+        station.completed_report = {"gpio_outputs_stopped": True}
+        ppm = next(i for i, row in enumerate(station.profile["channels"]) if row["group"] == "PPM")
+        station.assessment.results[ppm].status = "FAIL"
+        station.retest_gpio("PPM")
+        station.phase = "RUNNING"
+        station.assessment.results[ppm].status = "PASS"
+        station.advance_gpio_sequence(time.monotonic())
+        station.poll_gpio_stop(station.gpio_stop.deadline + .1)
+        self.assertEqual(station.phase, "STOPPED")
+        self.assertEqual(station.assessment.results[ppm].status, "FAIL")
+        self.assertFalse(station.can_retest_gpio("PPM"))
+        self.assertFalse(station.report_snapshot()["gpio_outputs_stopped"])
+        self.assertIn("STOP unconfirmed", station.state.get())
+
     def test_close_keeps_serial_owners_until_gpio_shutdown_is_confirmed(self):
         station = self.gpio_station()
         station.links = {role: Mock() for role in ("source", "probe")}
@@ -487,12 +602,97 @@ class SequenceTests(unittest.TestCase):
         self.assertEqual(next(row for row in rows if row["record_type"] == "summary")["status"], "FAIL")
 
     def test_first_gpio_transport_error_is_not_overwritten_by_disconnect_cleanup(self):
+        for stopping in (False, True):
+            with self.subTest(stopping=stopping):
+                station = self.gpio_station()
+                if stopping:
+                    station.stop()
+                station.handle("source", {"type": "link_error", "reason": "Detailed driver failure"})
+                station.handle("source", {"type": "disconnected"})
+                station.poll_gpio_stop(time.monotonic())
+                self.assertIn("Detailed driver failure", station.state.get())
+                self.assertIn("Detailed driver failure", station.report_snapshot()["gpio_stop_error"])
+
+    def test_disconnect_before_gpio_measurement_keeps_pins_unmeasured(self):
+        for phase in ("STARTING_PROBE", "STARTING_SOURCE"):
+            with self.subTest(phase=phase):
+                station = self.gpio_station()
+                station.phase = phase
+                station.handle("probe", {"type": "disconnected"})
+                self.assertEqual(station.phase, "STOPPING_GPIO")
+                self.assertEqual(len(station.commands), 2)
+                self.assertTrue(all(row.status == "NOT RUN" for row in station.assessment.results))
+
+    def test_interrupted_gpio_group_preserves_other_connectors_and_adc(self):
+        for failure in ("disconnect", "stale snapshot"):
+            with self.subTest(failure=failure):
+                station = self.gpio_station()
+                station.suite_active = True
+                station.gpio_sequence = sequence = GpioSequence(station.profile, ["TELEM1", "SPI6", "FMU PWM"])
+                sequence.position = 1
+                measured = station.assessment.results[sequence.indices["TELEM1"][0]]
+                measured.status = "PASS"
+                adc = next(i for i, row in enumerate(station.profile["channels"]) if row.get("method") == "adc_voltage")
+                station.assessment.results[adc].status = "PASS"
+                if failure == "disconnect":
+                    station.handle("probe", {"type": "disconnected"})
+                else:
+                    station.last_pump_at = 0
+                    station.assessment.started_at = time.monotonic() - 5
+                    station.report_snapshot()
+                self.assertEqual(station.phase, "STOPPING_GPIO")
+                self.assertEqual(measured.status, "PASS")
+                self.assertEqual(station.assessment.results[adc].status, "PASS")
+                self.assertTrue(all(station.assessment.results[i].status == "FAIL" for i in sequence.indices["SPI6"]))
+                self.assertTrue(all(station.assessment.results[i].status == "NOT RUN" for i in sequence.indices["FMU PWM"]))
+
+    def test_disconnect_during_gpio_shutdown_keeps_measurements_and_fails_shutdown(self):
         station = self.gpio_station()
-        station.stop()
+        station.suite_active, station.suite_stage = True, "gpio_only"
+        station.gpio_sequence = sequence = GpioSequence(station.profile, ["PPM"])
+        index, = sequence.indices["PPM"]
+        station.assessment.results[index].status = "PASS"
+        station.advance_gpio_sequence(time.monotonic())
+        self.assertEqual(station.phase, "STOPPING_GPIO")
         station.handle("source", {"type": "link_error", "reason": "Detailed driver failure"})
-        station.handle("source", {"type": "disconnected"})
         station.poll_gpio_stop(time.monotonic())
-        self.assertIn("Detailed driver failure", station.state.get())
+        report = station.report_snapshot()
+        self.assertEqual(report["channels"][index]["status"], "PASS")
+        self.assertFalse(report["gpio_outputs_stopped"])
+        self.assertFalse(report["selected_gpio_passed"])
+        self.assertFalse(report["all_passed"])
+        self.assertIn("Detailed driver failure", report["gpio_stop_error"])
+        self.assertTrue(all(row["status"] == "NOT RUN" for i, row in enumerate(report["channels"]) if i != index))
+
+    def test_stale_snapshot_finishing_gpio_starts_only_one_shutdown(self):
+        station = self.gpio_station()
+        station.suite_active, station.suite_stage = True, "gpio_only"
+        station.gpio_sequence = sequence = GpioSequence(station.profile, ["PPM"])
+        index, = sequence.indices["PPM"]
+        station.assessment.results[index].status = "PASS"
+        station.last_pump_at = 0
+        station.advance_gpio_sequence(time.monotonic())
+        self.assertEqual(station.phase, "STOPPING_GPIO")
+        self.assertFalse(station.suite_active)
+        self.assertIsNone(station.gpio_snapshot)
+        command = "STOP " + station.assessment.session
+        self.assertEqual(station.commands, [("source", command), ("probe", command)])
+
+    def test_stale_samples_do_not_preempt_gpio_stop_confirmation(self):
+        station = self.gpio_station()
+        station.suite_active, station.suite_stage = True, "gpio_only"
+        station.gpio_sequence = sequence = GpioSequence(station.profile, ["PPM"])
+        index, = sequence.indices["PPM"]
+        station.assessment.results[index].status = "PASS"
+        station.advance_gpio_sequence(time.monotonic())
+        station.handle("probe", {"type": "sample", "_received_at": station.gpio_stop.started_at - 3})
+        self.assertFalse(station.gpio_stop.done)
+        self.assertFalse(station.report_snapshot()["selected_gpio_passed"])
+        for role in ("probe", "source"):
+            station.handle(role, {"type": "stopped", "session": station.assessment.session, "reason": "requested"})
+        station.poll_gpio_stop(time.monotonic())
+        self.assertEqual(station.phase, "GPIO_COMPLETE")
+        self.assertTrue(station.report_snapshot()["selected_gpio_passed"])
 
     def test_manual_csv_uses_the_complete_automatic_schema(self):
         station = self.case.completed_controller()

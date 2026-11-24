@@ -1,4 +1,4 @@
-"""Real Tk adapter controls, automatic preparation, cancellation and Ethernet (DEMO)."""
+"""Real Tk adapter controls, explicit IP setup, cancellation and Ethernet (DEMO)."""
 from pathlib import Path
 import sys
 import time
@@ -12,8 +12,17 @@ from protocol_app import ProtocolStation
 root = tk.Tk()
 station = Station(root, Path(__file__).resolve().parents[1]/"profile.json", demo=True)
 panel = station.view.network_panel
-stage, failures, callbacks = "INITIAL", [], []
+stage, failures, callbacks, changes = "INITIAL", [], [], []
 deadline, heartbeat = time.monotonic() + 30, 0
+change = panel.backend.change
+
+
+def record_change(action, guid):
+    changes.append(action)
+    return change(action, guid)
+
+
+panel.backend.change = record_change
 
 
 def click(parent, text):
@@ -52,6 +61,11 @@ def check():
         elif stage == "CANCELLED" and not panel.worker.busy:
             assert not callbacks and panel.pending_test is None
             panel.prepare(lambda index: (callbacks.append(index), station.start_ethernet()))
+            stage = "NEEDS_IP"
+        elif stage == "NEEDS_IP" and not panel.worker.busy:
+            assert "Click Configure IP to continue" in panel.status.get()
+            assert not callbacks and changes == ["configure", "restore"]
+            assert click(panel, "Configure IP")
             stage = "ETH"
         elif stage == "ETH" and station.phase == "I2C_COMPLETE":
             assert callbacks == [1]
@@ -59,6 +73,11 @@ def check():
             assert panel.last_status["ready"]
             assert station.report_snapshot()["pc_ethernet"]["guid"] == panel.guid()
             assert station.view.ethernet_state.cget("fg") == GREEN
+            panel.prepare(callbacks.append)
+            stage = "REUSE_IP"
+        elif stage == "REUSE_IP" and not panel.worker.busy:
+            assert callbacks == [1, 1]
+            assert changes == ["configure", "restore", "configure"]
             def denied(*_): raise RuntimeError("Windows permission was cancelled")
             panel.backend.change = denied
             click(panel, "Restore")
@@ -103,4 +122,4 @@ def protocol_finish():
 root.after(1000, protocol_check)
 root.mainloop()
 if failures: raise failures[0]
-print("GUI: adapter selection, retained IP, configure/restore, automatic Ethernet setup, STOP cancellation and error display passed (DEMO)", flush=True)
+print("GUI: adapter selection, explicit configure/restore, address reuse, STOP cancellation and error display passed (DEMO)", flush=True)

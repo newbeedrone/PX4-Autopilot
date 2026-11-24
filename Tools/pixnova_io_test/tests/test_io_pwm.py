@@ -1,6 +1,7 @@
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -8,6 +9,7 @@ import test_protocol_model
 import test_station
 from app import IO_MODES
 from protocol_model import TESTS, MODE_NUMBER, ProtocolRun
+from workflow import GpioSequence, GpioStop
 
 
 class IoPwmTests(unittest.TestCase):
@@ -15,32 +17,62 @@ class IoPwmTests(unittest.TestCase):
         self.case = test_station.StationTests()
         self.case.setUp()
         station = self.case.completed_controller(pending_last=True)
-        station.suite_stage, station.extended_suite = "fmu", True
+        station.suite_stage, station.extended_suite = "fixed", True
+        station.root = Mock()
+        station.gpio_sequence = GpioSequence(station.profile)
         for cap in station.capabilities.values(): cap.update(io_pwm=1, session_stop=1, sbus_out=1)
         self.case.confirm_stop(station.i2c_run); station._update_i2c()
         station.i2c_results["CAN"] = {"status": "PASS", "outputs_stopped": True}
+        station.i2c_results["SBUS_OUT"] = {"status": "PASS", "outputs_stopped": True}
         return station
 
-    def test_full_workflow_waits_for_manual_harness_and_network_steps(self):
+    def confirm_gpio_stop(self, station, fmu=False):
+        now = time.monotonic()
+        sequence = station.gpio_sequence
+        sequence.position = len(sequence.groups) if fmu else len(sequence.groups) - 1
+        for group in sequence.groups[:sequence.position]:
+            indices = sequence.indices[group]
+            sequence.completed[group] = [{"status": "PASS", "frequency_hz": 25.0} for _ in indices]
+            for index in indices:
+                station.assessment.results[index].status = "PASS"
+        station.phase, station.suite_stage = "STOPPING_GPIO", "fmu" if fmu else "gpio"
+        station.gpio_stop = GpioStop(station.assessment.session, now, station.transmit)
+        frame = {"type": "stopped", "session": station.assessment.session, "reason": "requested"}
+        station.gpio_stop.handle("source", frame, now)
+        station.poll_gpio_stop(now)
+        self.assertEqual(station.phase, "STOPPING_GPIO")
+        station.gpio_stop.handle("probe", frame, now)
+        station.poll_gpio_stop(now)
+
+    def test_full_workflow_waits_for_ethernet_and_ends_with_confirmed_harness_switch(self):
         station = self.station()
+        self.assertEqual(station.suite_stage, "gpio")
+        self.confirm_gpio_stop(station)
+        self.assertEqual(station.phase, "WAITING_ETH")
+        self.assertFalse(station.suite_completed)
+        with patch("app.EthernetPeer", return_value=Mock()):
+            station.start_ethernet()
+        self.assertEqual(station.i2c_run.roles, {"source"})
+        station.i2c_run.complete("Verified real Ethernet exchange")
+        self.case.confirm_stop(station.i2c_run); station._update_i2c()
+        self.assertEqual(station.phase, "CHECKING")
+        self.assertTrue(station.report_snapshot()["ethernet_passed"])
+        self.assertTrue(station.report_snapshot()["adc_passed"])
+        self.assertEqual(station.assessment.results[0].frequency_hz, 25.0)
+        self.assertEqual(station.gpio_sequence.group, "FMU PWM")
+
+        self.confirm_gpio_stop(station, fmu=True)
         self.assertEqual(station.phase, "WAITING_IOV2")
         self.assertFalse(station.suite_completed)
         self.assertFalse(station.auto_start)
         self.assertIsNone(station.completed_report)
         self.assertFalse(any("IO_PWM" in command for _, command in station.commands))
         station.start_iov2()
-        for mode in IO_MODES + ("SBUS_OUT",):
+        for mode in IO_MODES:
             self.assertEqual(station.i2c_run.mode, mode)
             station.i2c_run.result.frequency_hz = TESTS[mode]["expected_hz"]
             station.i2c_run.complete("Measured output")
             self.case.confirm_stop(station.i2c_run); station._update_i2c()
-        self.assertEqual(station.phase, "WAITING_ETH")
-        self.assertFalse(station.suite_completed)
-        self.assertTrue(station.report_snapshot()["iov2_passed"])
-        with patch("app.EthernetPeer", return_value=Mock()): station.start_ethernet()
-        self.assertEqual(station.i2c_run.roles, {"source"})
-        station.i2c_run.complete("Verified real Ethernet exchange")
-        self.case.confirm_stop(station.i2c_run); station._update_i2c()
         self.assertEqual(station.phase, "COMPLETE")
         self.assertTrue(station.report_snapshot()["external_suite_passed"])
         self.assertIn("IOV2 8/8", station.state.get())
@@ -48,7 +80,7 @@ class IoPwmTests(unittest.TestCase):
 
     def test_missing_network_configuration_does_not_start_outputs_or_complete(self):
         station = self.station()
-        station.phase, station.suite_stage = "WAITING_ETH", "iov2"
+        self.confirm_gpio_stop(station)
         commands = list(station.commands)
         with patch("app.EthernetPeer", side_effect=ValueError("Configure isolated Ethernet")):
             station.start_ethernet()
@@ -58,6 +90,7 @@ class IoPwmTests(unittest.TestCase):
 
     def test_iov2_capability_is_required_and_manual_self_check_cancels_workflow(self):
         station = self.station()
+        self.confirm_gpio_stop(station, fmu=True)
         station.capabilities["probe"]["io_pwm"] = 0
         commands = list(station.commands)
         station.start_iov2()

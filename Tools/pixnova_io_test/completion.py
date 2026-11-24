@@ -69,7 +69,7 @@ def save_csv(report, directory, path=None):
     post = report.get("post_test", {})
     measurement_status = "PASS" if report.get("all_passed") else "FAIL"
     finalization_status = ("FAIL" if post.get("status") == "FAILED" else "PENDING" if post.get("status") == "SAVING" else
-                       "PASS" if post.get("status") == "COMPLETE" and post.get("restoration", {}).get("status") in ("PASS", "DEMO") else "NOT RUN")
+                       "PASS" if post.get("status") == "COMPLETE" and post.get("restoration", {}).get("status") in ("PASS", "DEMO", "SKIPPED") else "NOT RUN")
     workflow_status = "FAIL" if measurement_status == "FAIL" or finalization_status == "FAIL" else finalization_status
     summary_status = measurement_status if not post or measurement_status == "FAIL" else workflow_status if workflow_status in ("PASS", "PENDING") else "FAIL"
     shared = {"utc": report["utc"], "demo": report["demo"], "profile_sha256": report["profile_sha256"],
@@ -222,8 +222,9 @@ class CompletionWorker:
             progress("CSV saved: " + str(path))
             if self.demo:
                 restored = {"status": "DEMO", "crc_verified": False}
+            elif self.image is None:
+                restored = {"status": "SKIPPED", "reason": "No normal flight firmware selected"}
             else:
-                if self.image is None: raise ValueError("Normal flight firmware was not selected")
                 source_id = self.report["devices"]["source"]["device_id"]
                 restored = restore_usb(self.image, self.source_port, self.probe_port, source_id, progress)
             self.report["post_test"] = {"status": "COMPLETE", "csv": str(path), "restoration": restored}
@@ -243,7 +244,9 @@ class CompletionWorker:
 
 def prepare_plan(path, directory, demo):
     """File operations only; callable off the Tk thread."""
-    image = None if demo else FlightImage(path)
+    image = None if demo or not path else FlightImage(path)
+    if directory is None:
+        return image, None
     directory = Path(directory).expanduser().resolve()
     directory.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryFile(dir=directory): pass
@@ -263,6 +266,29 @@ class PreparationWorker:
         except Exception as error: self.events.put({"error": str(error)})
 
 
+class FirmwareUpdateWorker:
+    def __init__(self, image, source_port, probe_port, source_id, demo=False):
+        self.args = image, source_port, probe_port, source_id
+        self.demo = demo
+        self.events = queue.Queue()
+
+    def start(self):
+        threading.Thread(target=self.run, name="pixnova-update", daemon=True).start()
+
+    def run(self):
+        def progress(message):
+            self.events.put({"progress": message})
+        try:
+            if self.demo:
+                message = "DEMO · firmware update simulated"
+            else:
+                restore_usb(*self.args, progress)
+                message = "Flight firmware updated · CRC and reboot confirmed"
+            self.events.put({"update_status": message, "success": True})
+        except Exception as error:
+            self.events.put({"update_status": "Firmware update failed: " + str(error), "success": False})
+
+
 class CompletionPanel:
     def __init__(self, parent, station):
         import tkinter as tk
@@ -271,16 +297,19 @@ class CompletionPanel:
         self.station = station
         self.path = tk.StringVar()
         self.directory = tk.StringVar(value=str(Path.home()/"PixNovaTestReports"))
-        self.status = tk.StringVar(value="Choose normal flight firmware before Start test; CSV is saved before USB restoration.")
+        self.status = tk.StringVar()
+        self.reset_status()
         panel = tk.Frame(parent, bg=BG); panel.pack(fill="x", pady=(8, 0))
         label(panel, "Normal firmware", size=9).grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Entry(panel, textvariable=self.path).grid(row=0, column=1, sticky="ew")
         def choose():
             if station.operation_locked() or station.suite_active or not station.network_idle():
                 station.note("Choose normal firmware before starting the test."); return
-            selected = filedialog.askopenfilename(filetypes=[("PX4 firmware", "*.px4")])
+            selected = filedialog.askopenfilename(parent=station.root, filetypes=[("PX4 firmware", "*.px4")])
             if selected: self.path.set(selected)
         Action(panel, "Browse…", choose, width=90).grid(row=0, column=2, padx=(8, 0))
+        self.update_action = Action(panel, "Update Firmware", station.update_firmware, width=132)
+        self.update_action.grid(row=0, column=3, padx=(8, 0))
         label(panel, "CSV folder", size=9).grid(row=1, column=0, sticky="w", padx=(0, 8))
         ttk.Entry(panel, textvariable=self.directory).grid(row=1, column=1, sticky="ew", pady=(4, 0))
         def folder():
@@ -289,19 +318,21 @@ class CompletionPanel:
             selected = filedialog.askdirectory()
             if selected: self.directory.set(selected)
         Action(panel, "Browse…", folder, width=90).grid(row=1, column=2, padx=(8, 0), pady=(4, 0))
-        label(panel, variable=self.status, size=9, color=MUTED, anchor="w", justify="left", wraplength=1000).grid(row=2, column=0, columnspan=3, sticky="ew", pady=4)
-        label(panel, "Start with P21 on FMU PWM; switch to IOV2 only when prompted. PPM and SBUS OUT go from the flight controller to the fixture.", size=9, color=MUTED, anchor="w", justify="left", wraplength=1000).grid(row=3, column=0, columnspan=3, sticky="ew")
+        label(panel, variable=self.status, size=9, color=MUTED, anchor="w", justify="left", wraplength=900).grid(row=2, column=0, columnspan=4, sticky="ew", pady=4)
+        label(panel, "Start with P21 on FMU PWM. Switch to IOV2 when prompted. PPM and SBUS OUT go from the flight controller to the fixture.", size=9, color=MUTED, anchor="w", justify="left", wraplength=900).grid(row=3, column=0, columnspan=4, sticky="ew")
         panel.columnconfigure(1, weight=1)
 
     def selection(self, demo):
         if not self.directory.get().strip(): raise ValueError("Select the CSV results folder")
-        if not demo and not self.path.get().strip():
-            raise ValueError("Choose normal flight firmware with Browse before Start test")
         return self.path.get().strip(), self.directory.get().strip(), demo
+
+    def reset_status(self):
+        self.status.set("Optional: select a .px4 for USB restoration after testing. A blank path saves CSV only.")
 
     def prepared(self, plan, demo):
         image, directory = plan
-        self.status.set("After testing: CSV → " + str(directory) + " · " + ("DEMO; no hardware flashed" if demo else "restore " + image.path.name))
+        summary = "DEMO" if demo else "restore " + image.path.name if image else "CSV only"
+        self.status.set("After testing: CSV → " + str(directory) + " · " + summary)
 
     def prepare(self, demo):
         plan = prepare_plan(*self.selection(demo))

@@ -43,8 +43,13 @@ def check_pass():
         assert station.view.inspector_heading.cget("text") == "ADC VOLTAGE TEST"
         assert station.view.detail_values["error"].cget("text") == "3.300 V"
         assert station.view.detail_values["window"].cget("text") == "3.300 V"
+        pin_map = station.view.map
+        def adc_text():
+            return [pin_map.itemcget(item, "text") for item in pin_map.find_withtag(f"row:{adc3}") if pin_map.type(item) == "text"]
+        assert "PASS · 3.300 V" in adc_text()
         station.i2c_results["ADC3V3_HIGH"]["status"] = "FAIL"
         station._sync_adc_result(); station.draw_results()
+        assert "FAIL · 3.300 V" in adc_text()
         assert station.view.adc_cards["ADIO_ADC_3V3"][1].cget("fg") == RED
         assert station.view.adc_cards["ADIO_ADC_6V6"][1].cget("fg") == GREEN
         station.i2c_results["ADC3V3_HIGH"]["status"] = "PASS"
@@ -91,6 +96,7 @@ def check_fault():
         assert station.view.map.find_withtag("pin-fill:0")
         assert not station.view.map.find_withtag("pin-fill:4")
         # The details stay accessible on smaller displays through their own scroll area.
+        root.update_idletasks()
         station.view.inspector_scroll.yview_moveto(1)
         root.update_idletasks()
         assert station.view.inspector_scroll.yview()[1] == 1
@@ -102,6 +108,18 @@ def check_fault():
         assert station.view.sensor_cards["icm45686_spi1"]["state"].cget("fg") == GREEN
         assert station.view.path.itemcget("inspector:sensor", "outline") == RED
         assert not station.report_snapshot()["peripherals"]["onboard_passed"]
+        root.after(50, check_failed_self_check)
+    except Exception as error:
+        failures.append(error)
+        station.close()
+
+
+def check_failed_self_check():
+    if station.phase == "STOPPING_GPIO":
+        root.after(50, check_failed_self_check)
+        return
+    try:
+        assert station.phase == "STOPPED"
         station.demo_peripheral_fault.set(False)
         station.populate_demo_power()
         station.self_check()

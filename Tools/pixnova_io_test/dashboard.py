@@ -6,6 +6,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import ttk
 from peripherals import SENSORS, STORAGE, DEVICES, display_value
+from protocol_model import TESTS
 
 
 BG = "#0a101c"
@@ -64,8 +65,10 @@ class Action(tk.Canvas):
     def paint(self, hover=False):
         self.delete("all")
         width = self.winfo_width()
+        # A combobox popup can own focus without having a Tkinter widget.
+        focused = str(self.tk.call("focus")) == str(self)
         rounded(self, 1, 1, width - 1, 35, radius=8, fill=(self.hover if hover else self.fill) if self.enabled else INSET,
-                outline=BLUE if self.focus_get() == self else "")
+                outline=BLUE if focused else "")
         self.create_text(width / 2, 18, text=self.text, fill=self.fg if self.enabled else MUTED, font=(FONT, 10, "bold"))
 
     def set_enabled(self, enabled):
@@ -115,25 +118,19 @@ class PortMap(tk.Canvas):
     ROW_HEIGHT = 30
 
     def __init__(self, parent, dashboard):
-        super().__init__(parent, bg=BG, highlightthickness=0, yscrollincrement=24)
+        super().__init__(parent, bg=BG, highlightthickness=0, height=260)
         self.dashboard = dashboard
         self.signature = None
-        self.bind("<Configure>", lambda _: self.render(force=True))
-        self.bind("<MouseWheel>", self.wheel)
-        self.bind("<Button-4>", lambda _: self.yview_scroll(-3, "units"))
-        self.bind("<Button-5>", lambda _: self.yview_scroll(3, "units"))
+        self.bind("<Configure>", lambda _: self.render())
 
-    def wheel(self, event):
-        self.yview_scroll(-1 if event.delta > 0 else 1, "units")
-
-    def render(self, force=False):
+    def render(self):
         view, station = self.dashboard, self.dashboard.station
         results = station.assessment.results
-        signature = (self.winfo_width(), view.filter_group, view.faults_only, view.selected,
+        signature = (self.winfo_width(), view.filter_group, view.faults_only, view.selected, view.selected_iov2,
                      tuple((r.status, r.frequency_hz, r.voltage_low_mv, r.voltage_high_mv) for r in results),
                      tuple((mode, row.get("status"), row.get("frequency_hz"), row.get("probe_rx"), row.get("reason"))
                            for mode, row in station.i2c_results.items() if mode in getattr(view, "iov2_cards", {})))
-        if signature == self.signature and not force:
+        if signature == self.signature:
             return
         self.signature = signature
         self.delete("all")
@@ -168,18 +165,25 @@ class PortMap(tk.Canvas):
             visible += 1
         if not visible:
             io_fault = view.faults_only and any(station.i2c_results.get(mode, {}).get("status") == "FAIL" for mode in view.iov2_cards)
-            self.create_text(width / 2, 100, text="IOV2 faults shown above" if io_fault else "No failed pins" if view.faults_only else "No ports selected",
+            protocol_only = view.filter_group in view.protocol_groups and view.filter_group not in view.groups
+            heading = ("IOV2 faults shown above" if io_fault else "No failed pins" if view.faults_only else
+                       view.filter_group if protocol_only else "No ports selected")
+            self.create_text(width / 2, 100, text=heading,
                              fill=RED if io_fault else GREEN if view.faults_only else MUTED, font=(FONT, 16, "bold"))
             self.create_text(width / 2, 133, text="Select an IOV2 card to inspect the output." if io_fault else "Pin diagrams update with each measurement window.",
                              fill=MUTED, font=(FONT, 10))
-        self.configure(scrollregion=(0, 0, width, max(heights) + 8))
+        # Fit every card in the map. The results pane is the scrolling viewport.
+        bounds = self.bbox("all")
+        self.configure(height=max(260, bounds[3] + 12 if bounds else 0))
 
     def select_pin(self, index):
         self.dashboard.select(index)
+        self.after_idle(self.dashboard.reveal_pin_details)
 
     def select_io_pin(self, mode):
         self.dashboard.filter("IOV2 PWM")
         self.dashboard.select_iov2(mode)
+        self.after_idle(self.dashboard.reveal_pin_details)
 
     def io_card(self, x, y, width):
         from protocol_model import TESTS
@@ -245,15 +249,19 @@ class PortMap(tk.Canvas):
             self.create_text(px + 20, y + 104, text="PG5" if signal else "GND" if pin["number"] == 3 else "POWER",
                              fill=fg, font=(MONO, 8))
             if signal:
-                self.tag_bind(tag, "<Button-1>", lambda _: view.filter("SBUS OUT"))
+                self.tag_bind(tag, "<Button-1>", lambda _: self.select_sbus_pin())
         self.create_text(x + 14, y + 132, text="IO PB10 → PG5", anchor="w", fill=color, font=(MONO, 10, "bold"))
         rate = result.get("frequency_hz")
         self.create_text(x + width - 14, y + 132, text=f"{rate:.2f} fps" if rate is not None else "— fps",
                          anchor="e", fill=color, font=(MONO, 9))
         self.create_text(x + 14, y + 158, text=f"Decoded frames: {result.get('probe_rx', 0)} · 100 kbaud 8E2",
                          anchor="w", fill=color, font=(FONT, 8))
-        self.create_text(x + 14, y + 180, text=result.get("reason", "Select SBUS OUT at left; use Test SBUS OUT above."),
+        self.create_text(x + 14, y + 180, text=result.get("reason", "Select SBUS OUT at left; use Retest SBUS OUT above."),
                          anchor="nw", width=width - 28, fill=color, font=(FONT, 8))
+
+    def select_sbus_pin(self):
+        self.dashboard.filter("SBUS OUT")
+        self.after_idle(self.dashboard.reveal_pin_details)
 
     def card(self, x, y, width, height, group, indices):
         view, station = self.dashboard, self.dashboard.station
@@ -303,7 +311,9 @@ class PortMap(tk.Canvas):
                              fill=fg, font=(MONO, 9), tags=(tag,))
             measured = f"{result.frequency_hz:.2f}" if result.frequency_hz is not None else "—"
             if adc:
-                measured = f"{result.voltage_high_mv / 1000:.3f} V" if result.voltage_high_mv is not None else "—"
+                measured = result.status
+                if result.voltage_high_mv is not None:
+                    measured += f" · {result.voltage_high_mv / 1000:.3f} V"
             self.create_text(x + width - 14, ry, text=measured, anchor="e", fill=fg, font=(MONO, 9), tags=(tag,))
             self.tag_bind(tag, "<Button-1>", lambda _, i=index: self.select_pin(i))
         for offset, pin in enumerate(pin for pin in positions if pin.get("note")):
@@ -321,6 +331,12 @@ class Dashboard:
         self.groups = OrderedDict()
         for index, row in enumerate(station.profile["channels"]):
             self.groups.setdefault(row["group"], []).append(index)
+        self.gpio_groups = {row["group"] for row in station.profile["channels"] if row.get("method") != "adc_voltage"}
+        self.protocol_groups = {"IOV2 PWM": [f"IO_PWM{i}" for i in range(1, 9)], "SBUS OUT": ["SBUS_OUT"]}
+        for mode, spec in TESTS.items():
+            if spec.get("kind") == "i2c":
+                self.protocol_groups.setdefault(spec["group"], []).append(mode)
+        self.protocol_groups.update(CAN=["CAN"], Ethernet=["ETH"])
         self.selected, self.filter_group, self.faults_only = 0, None, False
         self.selected_iov2 = None
         self.nav_items, self.metric_labels = {}, {}
@@ -355,14 +371,19 @@ class Dashboard:
         self._nav(sidebar, "SBUS OUT", "SBUS OUT")
         for group in self.groups:
             self._nav(sidebar, group, group)
+        for group in self.protocol_groups:
+            if group not in self.nav_items:
+                self._nav(sidebar, group, group)
         protected = tk.Frame(sidebar, bg=SIDEBAR)
         protected.pack(side="bottom", fill="x", padx=20, pady=24)
         label(protected, "SENSOR BUSES", size=8, color=MUTED).pack(anchor="w")
         label(protected, "I2C1 / 2 / 3 / 4", size=9, color=BLUE).pack(anchor="w", pady=(6, 2))
         label(protected, "Protected · no waveforms", size=8, color=MUTED).pack(anchor="w")
-        body = tk.Frame(root, bg=BG)
-        body.pack(side="left", fill="both", expand=True, padx=24, pady=20)
-        heading = tk.Frame(body, bg=BG)
+        content = tk.Frame(root, bg=BG)
+        content.pack(side="left", fill="both", expand=True)
+        controls = tk.Frame(content, bg=BG)
+        controls.pack(fill="x", padx=(24, 34), pady=(20, 6))
+        heading = tk.Frame(controls, bg=BG)
         heading.pack(fill="x")
         titles = tk.Frame(heading, bg=BG)
         titles.pack(side="left")
@@ -377,9 +398,27 @@ class Dashboard:
         Action(actions, "Protocols", self.station.open_protocols, width=100).pack(side="left", padx=(0, 8))
         Action(actions, "■  Stop", self.station.stop, width=80, danger=True).pack(side="left", padx=(0, 8))
         Action(actions, "▶  Start test", self.station.start_full_test, width=122, primary=True).pack(side="left")
-        self._connections(body)
+        self._connections(controls)
         from completion import CompletionPanel
-        self.completion = CompletionPanel(body, self.station)
+        self.completion = CompletionPanel(controls, self.station)
+
+        viewport = tk.Frame(content, bg=BG)
+        viewport.pack(fill="both", expand=True)
+        self.page = tk.Canvas(viewport, bg=BG, highlightthickness=0, yscrollincrement=24)
+        page_scroll = ttk.Scrollbar(viewport, orient="vertical", command=self.page.yview)
+        self.page.configure(yscrollcommand=page_scroll.set)
+        page_scroll.pack(side="right", fill="y")
+        self.page.pack(side="left", fill="both", expand=True)
+        body = tk.Frame(self.page, bg=BG)
+        page_body = self.page.create_window(24, 8, anchor="nw", window=body)
+        self.page.bind("<Configure>", lambda event: self.page.itemconfigure(page_body, width=max(1, event.width - 48)))
+        body.bind("<Configure>", lambda event: self.page.configure(scrollregion=(0, 0, self.page.winfo_width(), event.height + 28)))
+        self.gpio_retest_row = tk.Frame(body, bg=BG)
+        self.gpio_retest_action = Action(self.gpio_retest_row, "Retest GPIO",
+                                         lambda: self.station.retest_gpio(self.filter_group), width=190)
+        self.gpio_retest_action.pack(side="left")
+        self.gpio_retest_note = label(self.gpio_retest_row, "", color=AMBER, size=9)
+        self.gpio_retest_note.pack(side="left", padx=12)
         self._peripherals(body)
         self._i2c_tests(body)
         metrics = tk.Frame(body, bg=BG)
@@ -408,17 +447,24 @@ class Dashboard:
         self.map_title.pack(side="left")
         for text, color in [("Pass", GREEN), ("Fail", RED), ("Checking", AMBER), ("Excluded", "#52647e")]:
             label(toolbar, "● " + text, color=color, size=8).pack(side="right", padx=(10, 0))
-        maps = tk.Frame(center, bg=BG)
-        maps.pack(fill="both", expand=True)
-        self.map = PortMap(maps, self)
-        scroll = ttk.Scrollbar(maps, orient="vertical", command=self.map.yview)
-        self.map.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
-        self.map.pack(side="left", fill="both", expand=True)
+        self.map = PortMap(center, self)
+        self.map.pack(fill="x")
         label(center, "Probe pin numbers follow the schematic; diagram is not a connector mating view.",
               size=8, color=MUTED).pack(anchor="w", pady=(8, 0))
         self._log(body)
+        for event in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            root.bind(event, self.scroll_page, add="+")
         self.render()
+
+    def scroll_page(self, event):
+        widget = event.widget
+        while widget is not None:
+            if widget in (self.inspector_scroll, self.log) or isinstance(widget, (ttk.Combobox, ttk.Scrollbar)):
+                return
+            if widget is self.page:
+                self.page.yview_scroll(-3 if event.delta > 0 or event.num == 4 else 3, "units")
+                return "break"
+            widget = getattr(widget, "master", None)
 
     def _theme(self):
         style = ttk.Style(self.root)
@@ -439,12 +485,17 @@ class Dashboard:
     def _nav(self, parent, text, key):
         row = tk.Frame(parent, bg=SIDEBAR, cursor="hand2")
         row.pack(fill="x", padx=10, pady=1)
-        title = label(row, text, size=10, color=MUTED, padx=10, pady=6, anchor="w")
+        title = label(row, text, size=10, color=MUTED, padx=10, pady=2, anchor="w")
         title.pack(side="left", fill="x", expand=True)
         count = label(row, "", size=9, color=MUTED, padx=10)
         count.pack(side="right")
+
+        def select_group(_):
+            self.filter(key)
+            self.page.yview_moveto(0)
+
         for widget in (row, title, count):
-            widget.bind("<Button-1>", lambda _, k=key: self.filter(k))
+            widget.bind("<Button-1>", select_group)
         self.nav_items[key] = (row, title, count)
 
     def _connections(self, parent):
@@ -467,7 +518,8 @@ class Dashboard:
             setattr(self, role + "_combo", combo)
         Action(inside, "↻  Refresh", self.station.refresh_ports, width=94).pack(side="left", padx=(4, 8), pady=(17, 0))
         Action(inside, "Connect USB", self.station.connect, width=110).pack(side="left", padx=(0, 8), pady=(17, 0))
-        Action(inside, "Self-check", self.station.self_check, width=100).pack(side="left", pady=(17, 0))
+        self.onboard_retest_action = Action(inside, "Retest Onboard", self.station.retest_onboard, width=138)
+        self.onboard_retest_action.pack(side="left", pady=(17, 0))
         status_row = tk.Frame(box, bg=INSET)
         status_row.pack(fill="x")
         self.state_label = label(status_row, variable=self.station.state, color=BLUE, size=10, bold=True, anchor="w", justify="left", padx=14, pady=8)
@@ -494,9 +546,7 @@ class Dashboard:
             box.grid(row=0, column=column, sticky="nsew", padx=3)
             label(box, spec["name"], size=10, bold=True).pack(anchor="w")
             state = label(box, "NOT RUN", size=9, color=MUTED); state.pack(anchor="w", pady=3)
-            button = label(box, "Test I2C →", size=9, color=BLUE, cursor="hand2")
-            button.pack(anchor="w")
-            button.bind("<Button-1>", lambda _, name=mode: self.station.start_i2c(name))
+            Action(box, "Retest I2C", lambda name=mode: self.station.start_i2c(name), width=96).pack(anchor="w")
             self.i2c_cards[mode] = (box, state)
         self.adc_cards = {}
         adc_rows = [row for row in self.station.profile["channels"] if row.get("method") == "adc_voltage"]
@@ -506,8 +556,7 @@ class Dashboard:
             box.grid(row=0, column=column, sticky="nsew", padx=3)
             label(box, "ADIO · ADC" + row["id"].removeprefix("ADIO_ADC_"), size=10, bold=True).pack(anchor="w")
             state = label(box, "NOT RUN", size=9, color=MUTED); state.pack(anchor="w", pady=3)
-            button = label(box, "Test ADC →", size=9, color=BLUE, cursor="hand2"); button.pack(anchor="w")
-            button.bind("<Button-1>", lambda _, channel=row["id"]: self.station.start_adc(channel))
+            Action(box, "Retest ADC", lambda channel=row["id"]: self.station.start_adc(channel), width=96).pack(anchor="w")
             self.adc_cards[row["id"]] = (box, state)
 
         can = tk.Frame(section, bg=BG)
@@ -516,13 +565,14 @@ class Dashboard:
         label(can, TESTS["CAN"]["wiring"], size=9, color=MUTED, wraplength=900, justify="left").pack(anchor="w")
         self.can_state = label(can, "NOT RUN", size=9, color=MUTED)
         self.can_state.pack(anchor="w", pady=5)
-        Action(can, "Test CAN", self.station.start_can, width=120).pack(anchor="w")
+        Action(can, "Retest CAN", self.station.start_can, width=120).pack(anchor="w")
 
         io = tk.Frame(section, bg=BG)
         self.connector_groups["IOV2 PWM"] = io
         header = tk.Frame(io, bg=BG); header.pack(fill="x", pady=(5, 3))
         label(header, "After FMU stops: move the P21 harness to IOV2 PWM1–8. Signal pins and GND only.", size=9, color=AMBER).pack(side="left")
-        Action(header, "Confirm IOV2 wiring", self.station.start_iov2, width=165).pack(side="right")
+        self.iov2_start_action = Action(header, "Retest IOV2", self.station.start_iov2, width=165)
+        self.iov2_start_action.pack(side="right")
         outputs = tk.Frame(io, bg=BG); outputs.pack(fill="x")
         self.iov2_cards = {}
         for column, (mode, spec) in enumerate((m, s) for m, s in TESTS.items() if s.get("kind") == "io_pwm"):
@@ -533,8 +583,7 @@ class Dashboard:
             pin = label(box, f"P21.{spec['probe_connector_pin']} · {spec['probe_pin']}", size=8, color=MUTED); pin.pack(anchor="w")
             state = label(box, "NOT RUN", size=9, color=MUTED); state.pack(anchor="w", pady=3)
             frequency = label(box, f"Target {spec['expected_hz']} Hz", size=8, color=MUTED); frequency.pack(anchor="w")
-            retest = label(box, "Retest →", size=8, color=BLUE, cursor="hand2"); retest.pack(anchor="w", pady=(3, 0))
-            retest.bind("<Button-1>", lambda _, key=mode: self.station.start_iov2(key))
+            Action(box, "Retest", lambda key=mode: self.station.start_iov2(key), width=70).pack(anchor="w", pady=(3, 0))
             for widget in (box, title, pin, state, frequency):
                 widget.configure(cursor="hand2")
                 widget.bind("<Button-1>", lambda _, key=mode: self.select_iov2(key))
@@ -546,7 +595,7 @@ class Dashboard:
         title.pack(side="left")
         state = label(sbus, "NOT RUN", size=9, color=MUTED); state.pack(side="left", padx=14)
         frequency = label(sbus, "100 kbaud · 8E2 · 25 bytes", size=9, color=MUTED); frequency.pack(side="left")
-        Action(sbus, "Test SBUS OUT", self.station.start_sbus_out, width=128).pack(side="right")
+        Action(sbus, "Retest SBUS OUT", self.station.start_sbus_out, width=142).pack(side="right")
         for widget in (sbus, title, state, frequency):
             widget.configure(cursor="hand2")
             widget.bind("<Button-1>", lambda _: self.select_iov2("SBUS_OUT"))
@@ -556,7 +605,7 @@ class Dashboard:
         self.connector_groups["Ethernet"] = network
         heading = tk.Frame(network, bg=PANEL); heading.pack(fill="x")
         label(heading, "PIXNOVA ↔ PC · ETHERNET", size=10, bold=True).pack(side="left")
-        Action(heading, "Test Ethernet", self.station.start_ethernet, width=126).pack(side="right")
+        Action(heading, "Retest Ethernet", self.station.start_ethernet, width=136).pack(side="right")
         from network_ui import NetworkPanel
         self.network_panel = NetworkPanel(network, demo=self.station.demo, can_change=self.station.network_idle)
         self.network_panel.pack(fill="x", pady=7)
@@ -620,6 +669,7 @@ class Dashboard:
 
     def _peripherals(self, parent):
         section = tk.Frame(parent, bg=BG)
+        self.peripheral_section = section
         section.pack(fill="x", pady=(14, 0))
         heading = tk.Frame(section, bg=BG)
         heading.pack(fill="x", pady=(0, 7))
@@ -730,6 +780,10 @@ class Dashboard:
         self.filter_group = None if key in (None, "failed") else key
         if key in ("CAN1", "CAN2", "CAN"):
             self.select_connector_group("CAN")
+        elif key == "Ethernet":
+            self.select_connector_group("Ethernet")
+        elif key == "AD&IO" or key in self.protocol_groups and key not in ("IOV2 PWM", "SBUS OUT"):
+            self.select_connector_group("I2C / ADC")
         if key in ("IOV2 PWM", "SBUS OUT"):
             self.selected_sensor = None
             self.selected_iov2 = "SBUS_OUT" if key == "SBUS OUT" else "IO_PWM1"
@@ -740,8 +794,15 @@ class Dashboard:
         candidates = [i for i, result in enumerate(self.station.assessment.results) if result.status == "FAIL"] if self.faults_only else self.groups.get(key, [])
         if candidates and self.selected not in candidates:
             self.selected = candidates[0]
-        self.map.yview_moveto(0)
         self.render()
+
+    def reveal_pin_details(self):
+        offset = self.inspector_scroll.winfo_rooty() - self.page.winfo_rooty()
+        if 0 <= offset < self.page.winfo_height() - 100:
+            return
+        _, top, _, bottom = map(int, self.page.cget("scrollregion").split())
+        if bottom > top:
+            self.page.yview_moveto((self.page.canvasy(0) + offset - top) / (bottom - top))
 
     def select(self, index):
         self.selected_iov2 = None
@@ -791,6 +852,24 @@ class Dashboard:
 
     def render(self):
         self.export_action.set_enabled(self.station.network_idle() and not self.station.network_busy())
+        self.completion.update_action.set_enabled(self.station.can_update_firmware())
+        self.onboard_retest_action.set_enabled(self.station.can_retest_onboard())
+        group = self.filter_group
+        if group in self.gpio_groups:
+            if not self.gpio_retest_row.winfo_manager():
+                self.gpio_retest_row.pack(fill="x", pady=(0, 8), before=self.peripheral_section)
+            name = f"Retest {group}" + (" GPIO" if group in self.protocol_groups or group == "AD&IO" else "")
+            if self.gpio_retest_action.text != name:
+                self.gpio_retest_action.text = name
+                self.gpio_retest_action.paint()
+            self.gpio_retest_action.set_enabled(self.station.can_retest_gpio(group))
+            self.gpio_retest_note.configure(text="Connect P21 to FMU PWM before retesting." if group == "FMU PWM" else "")
+        elif self.gpio_retest_row.winfo_manager():
+            self.gpio_retest_row.pack_forget()
+        iov2_text = "Confirm IOV2 wiring" if self.station.phase == "WAITING_IOV2" else "Retest IOV2"
+        if self.iov2_start_action.text != iov2_text:
+            self.iov2_start_action.text = iov2_text
+            self.iov2_start_action.paint()
         results = self.station.assessment.results
         passed = sum(result.status == "PASS" for result in results)
         failed = sum(result.status == "FAIL" for result in results)
@@ -804,19 +883,17 @@ class Dashboard:
         for key, (frame, title, count) in self.nav_items.items():
             selected = key == "failed" if self.faults_only else key == self.filter_group
             bg = "#1b2e49" if selected else SIDEBAR
-            if key == "SBUS OUT":
-                status = self.station.i2c_results.get("SBUS_OUT", {}).get("status", "NOT RUN")
-                color = GREEN if status == "PASS" else RED if status == "FAIL" else MUTED
-                count.configure(text=status if status in ("PASS", "FAIL") else "0/1", fg=color, bg=bg)
-                title.configure(fg=color if status in ("PASS", "FAIL") else TEXT if selected else MUTED, bg=bg)
-                frame.configure(bg=bg)
-                continue
-            if key == "IOV2 PWM":
-                states = [self.station.i2c_results.get(f"IO_PWM{i}", {}).get("status", "NOT RUN") for i in range(1, 9)]
-                passed_io, failed_io = states.count("PASS"), states.count("FAIL")
-                color = RED if failed_io else GREEN if passed_io == 8 else MUTED
-                count.configure(text=f"{failed_io} FAIL" if failed_io else f"{passed_io}/8", fg=color, bg=bg)
-                title.configure(fg=color if failed_io or passed_io == 8 else TEXT if selected else MUTED, bg=bg)
+            if key not in (None, "failed"):
+                states = [results[index].status for index in self.groups.get(key, ())]
+                states.extend(self.station.i2c_results.get(mode, {}).get("status", "NOT RUN")
+                              for mode in self.protocol_groups.get(key, ()))
+                good, bad = states.count("PASS"), states.count("FAIL")
+                complete = bool(states) and good == len(states)
+                badge = ("FAIL" if bad == 1 and len(states) == 1 else f"{bad} FAIL" if bad else
+                         "PASS" if complete else f"{good}/{len(states)}")
+                color = RED if bad else GREEN if complete else MUTED
+                count.configure(text=badge, fg=color, bg=bg)
+                title.configure(fg=color if bad or complete else TEXT if selected else MUTED, bg=bg)
                 frame.configure(bg=bg)
                 continue
             indices = self.groups.get(key, range(len(results)))

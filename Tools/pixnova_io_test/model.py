@@ -101,9 +101,16 @@ class Assessment:
             if last_seen is not None and now - last_seen > timeout:
                 self._fail(result, "Measurement timeout")
 
-    def invalidate(self, reason):
+    def invalidate(self, reason, indices=None):
+        if indices is None:
+            indices = range(len(self.results))
+        for index in indices:
+            self._fail(self.results[index], reason)
+
+    def mark_unmeasured(self, reason):
         for result in self.results:
-            self._fail(result, reason)
+            if result.status == "WAITING":
+                result.status, result.reason = "NOT RUN", reason
 
     @property
     def all_passed(self):

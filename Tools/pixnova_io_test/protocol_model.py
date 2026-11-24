@@ -115,24 +115,14 @@ class ProtocolRun:
         if self.phase in ("COMPLETE", "FAILED", "STOPPED") or role not in self.roles:
             return
         self.now = now
-        received = frame.get("_received_at", now)
-        if type(received) not in (float, int) or not 0 <= now - received < 2:
-            self.fail("Stale USB response"); return
         kind = frame.get("type")
-        if kind in ("error", "link_error", "disconnected"):
-            reason = frame.get("reason", kind)
-            if reason == "protocol_setup_failed" and self.mode == "ETH":
-                reason = f"Ethernet PHY/link setup failed ({frame.get('detail')}); check the adapter, cable and PC interface"
-            elif reason == "protocol_setup_failed" and TESTS[self.mode].get("kind") == "io_pwm":
-                reason = f"IOV2 setup failed ({frame.get('detail')}); IO must be idle with zero disarmed outputs; power-cycle the board after loading test firmware"
-            self.fail(f"{role}: {reason}"); return
-        if frame.get("session") != self.session:
-            return
-        if self.phase == "STOPPING":
+        received = frame.get("_received_at", now)
+        fresh = type(received) in (float, int) and 0 <= now - received < 2
+        if self.phase == "STOPPING" and kind not in ("error", "link_error", "disconnected"):
             if now > self.deadline:
                 self.tick(now)
-                return
-            if kind == "stopped" and received >= self.stop_started:
+            elif (kind == "stopped" and frame.get("session") == self.session
+                  and fresh and received >= self.stop_started):
                 if frame.get("reason") != "requested":
                     self.fail(f"{role}: unexpected STOP reason: {frame.get('reason')}")
                     return
@@ -141,6 +131,17 @@ class ProtocolRun:
                     self._finish_stop()
                 else:
                     self._stop_message()
+            return
+        if not fresh:
+            self.fail("Stale USB response"); return
+        if kind in ("error", "link_error", "disconnected"):
+            reason = frame.get("reason", kind)
+            if reason == "protocol_setup_failed" and self.mode == "ETH":
+                reason = f"Ethernet PHY/link setup failed ({frame.get('detail')}); check the adapter, cable and PC interface"
+            elif reason == "protocol_setup_failed" and TESTS[self.mode].get("kind") == "io_pwm":
+                reason = f"IOV2 setup failed ({frame.get('detail')}); IO must be idle with zero disarmed outputs; power-cycle the board after loading test firmware"
+            self.fail(f"{role}: {reason}"); return
+        if frame.get("session") != self.session:
             return
         if kind == "stopped":
             if self.phase == "RC_LOSS" and role == "probe":

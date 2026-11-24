@@ -483,7 +483,11 @@ void Endpoint::command(char *line)
 
 void Endpoint::check_interfaces(const char *session, const char *mode)
 {
-	stop();
+	if (!stop()) {
+		send("{\"type\":\"error\",\"reason\":\"cleanup_failed\"}\n");
+		return;
+	}
+
 	strcpy(_session, session);
 	const hrt_abstime before = hrt_absolute_time();
 	usleep(5000);

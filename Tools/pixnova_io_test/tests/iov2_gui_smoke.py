@@ -45,7 +45,7 @@ def check():
             assert station.report_snapshot()["iov2_passed"]
             assert "8/8 PASS" in station.state.get()
             assert station.view.nav_items["IOV2 PWM"][1].cget("fg") == GREEN
-            assert station.view.nav_items["IOV2 PWM"][2].cget("text") == "8/8"
+            assert station.view.nav_items["IOV2 PWM"][2].cget("text") == "PASS"
             for mode in IO_MODES:
                 assert station.i2c_results[mode]["outputs_stopped"]
                 assert station.view.iov2_cards[mode][1].cget("fg") == GREEN

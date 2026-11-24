@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from network_config import NetworkSettings, NetworkWorker, UnicastRow, TEST_ADDRESS
+from network_config import NetworkSettings, NetworkWorker, UnicastRow, TEST_ADDRESS, elevated_change, main
 
 GUID = "eeb924f4-ed98-407c-b593-106b5de2b65f"
 OTHER = "00000000-0000-0000-0000-000000000002"
@@ -172,6 +172,31 @@ except RuntimeError:
         self.assertTrue(result["owned"])
         self.assertIsNotNone(self.nic.address)
         with self.assertRaises(ValueError): self.settings.ready_index(GUID)
+
+    def test_administrator_helper_writes_in_place_to_the_callers_response_file(self):
+        def invoke(args):
+            response = Path(args[args.index("--result") + 1])
+            identity = response.stat().st_ino
+            self.assertEqual(response.stat().st_size, 0)
+            with patch("network_config.NetworkSettings", return_value=self.settings):
+                main(args[1:])
+            self.assertEqual(response.stat().st_ino, identity)
+
+        with patch("network_config.run_elevated", side_effect=invoke):
+            self.assertTrue(elevated_change("configure", GUID, self.directory.name)["ready"])
+            self.assertFalse(elevated_change("restore", GUID, self.directory.name)["ready"])
+
+    def test_administrator_helper_failure_preserves_the_returned_error(self):
+        with patch("network_config.run_elevated", side_effect=lambda args: main(args[1:])), \
+             patch("network_config.NetworkSettings", return_value=self.settings), \
+             patch.object(self.settings, "configure_local", side_effect=ValueError("Test address conflict")):
+            with self.assertRaisesRegex(RuntimeError, "Test address conflict"):
+                elevated_change("configure", GUID, self.directory.name)
+
+    def test_administrator_helper_without_response_reports_a_startup_error(self):
+        with patch("network_config.run_elevated"):
+            with self.assertRaisesRegex(RuntimeError, "Administrator helper did not return a readable result"):
+                elevated_change("configure", GUID, self.directory.name)
 
     def test_tentative_address_waits_for_dad(self):
         self.nic.next_dad = 1

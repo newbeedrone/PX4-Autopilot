@@ -358,6 +358,7 @@ class StationTests(unittest.TestCase):
         self.assertFalse(station.report_snapshot()["test_suite_completed"])
         self.assertFalse(station.report_snapshot()["external_suite_passed"])
         self.assertNotIn("TEST COMPLETE", station.state.get())
+        station.handle("probe", {"type": "protocol_sample", "session": run.session, "_received_at": run.stop_started - 3})
         station.handle("source", {"type": "stopped", "session": run.session, "reason": "requested"})
         self.assertIsNone(station.completed_report)
         station.handle("probe", {"type": "stopped", "session": run.session, "reason": "requested"})
@@ -528,9 +529,38 @@ class StationTests(unittest.TestCase):
     def test_usb_handshake_failure_does_not_claim_unmeasured_pins_failed(self):
         station = self.make_controller()
         station.phase = "CONNECTING"
-        station.handle("source", {"type": "link_error", "reason": "USB disconnected"})
+        station.hello.clear()
+        station.peripherals.reset()
+        station.handle("source", {"type": "link_error", "reason": "COM145 could not be opened"})
         self.assertEqual(station.phase, "STOPPED")
+        first_failure = station.state.get()
+        commands = list(station.commands)
+        # The serial workers can still deliver a peer's HELLO reply and their
+        # terminal disconnect notifications after the handshake has failed.
+        station.handle("probe", {"type": "hello"})
+        station.handle("probe", {"type": "power_check", "test": "probe_protocol_firmware", "pass": True, "detail": 1})
+        station.handle("probe", {"type": "power_checked", "pass": True, "count": 1, "checked_us": 10, "uptime_us": 20})
+        station.handle("source", {"type": "disconnected"})
+        self.assertEqual(station.state.get(), first_failure)
+        self.assertEqual(station.commands, commands)
         self.assertTrue(all(row.status == "NOT RUN" for row in station.assessment.results))
+
+    def test_usb_disconnect_with_idle_outputs_keeps_recorded_pin_results(self):
+        for phase in ("READY", "PREPARING", "CHECKING", "WAITING_IOV2"):
+            with self.subTest(phase=phase):
+                station = self.make_controller()
+                station.phase = phase
+                measured, failed, pending = station.assessment.results[:3]
+                measured.status, measured.frequency_hz = "PASS", 100.0
+                failed.status, failed.reason = "FAIL", "Frequency outside tolerance"
+                if phase == "CHECKING":
+                    pending.status = "WAITING"
+                station.handle("probe", {"type": "disconnected"})
+                self.assertEqual(station.phase, "STOPPED")
+                self.assertNotIn("probe", station.hello)
+                self.assertEqual((measured.status, measured.frequency_hz), ("PASS", 100.0))
+                self.assertEqual((failed.status, failed.reason), ("FAIL", "Frequency outside tolerance"))
+                self.assertEqual(pending.status, "NOT RUN")
 
     def critical_details(self, station, role):
         tests = (("hrt_clock", 5000), ("gpio_inputs", 43), ("i2c1_no_attached_devices", 0)) if role == "source" else (("hrt_clock", 5000), ("gpio_inputs", 43), (station.peripherals.probe_check, 1))
@@ -630,6 +660,10 @@ class StationTests(unittest.TestCase):
         station.phase = "CONNECTING"
         station.hello.clear()
         station.peripherals.reset()
+        station.handle("probe", dict(type="power_check", test="probe_protocol_firmware", detail=1, **{"pass": True}))
+        self.assertEqual(station.phase, "CONNECTING")
+        self.assertFalse(station.peripherals.power["probe"])
+        self.assertFalse(station.commands)
         for role, device in (("source", "a" * 32), ("probe", "b" * 32)):
             station.handle(role, dict(type="hello", role=role, protocol=3, profile=self.digest, channels=43,
                                       device_id=device, firmware="a" * 16, protocol_tests=1, independent_external_checks=1))
@@ -638,6 +672,7 @@ class StationTests(unittest.TestCase):
                 station.handle(role, dict(type="power_check", test=name, detail=detail, **{"pass": True}))
             station.handle(role, dict(type="power_checked", count=len(tests), checked_us=10, uptime_us=20, **{"pass": True}))
         self.assertEqual(station.phase, "READY")
+        self.assertFalse(station.commands)
         station.start()
         self.source_check_details(station)
         for role in ("source", "probe"):
@@ -748,7 +783,8 @@ class StationTests(unittest.TestCase):
             station.pump()
         self.assertEqual(station.phase, "STOPPING_GPIO")
         self.assertFalse(station.assessment.all_passed)
-        self.assertTrue(all(row.status == "FAIL" for row in station.assessment.results))
+        for channel, row in zip(station.profile["channels"], station.assessment.results):
+            self.assertEqual(row.status, "NOT RUN" if channel.get("method") == "adc_voltage" else "FAIL")
 
     def test_expired_results_cannot_be_exported_as_passed(self):
         station = self.make_controller()
@@ -804,11 +840,19 @@ class StationTests(unittest.TestCase):
         station.source_port, station.probe_port = Mock(), Mock()
         station.source_port.get.return_value, station.probe_port.get.return_value = "COM4", "COM5"
         station.events, station.connected_at = queue.Queue(), {}
+        station.completed_report = {"all_passed": True}
+        station.assessment.results[0].status = "PASS"
+        station.i2c_results["CAN"] = {"status": "PASS"}
+        station.check_details = [{"test": "old"}]
         with patch("app.SerialEndpoint") as endpoint:
             station.connect()
         self.assertEqual(station.phase, "CONNECTING")
         self.assertEqual(station.generation, 1)
         self.assertEqual(endpoint.call_count, 2)
+        self.assertIsNone(station.completed_report)
+        self.assertEqual(station.assessment.results[0].status, "NOT RUN")
+        self.assertFalse(station.i2c_results)
+        self.assertFalse(station.check_details)
         for link in old_links.values():
             link.close.assert_called_once()
         station.handle("source", dict(type="disconnected", _connection=0))
@@ -1093,9 +1137,14 @@ class StationTests(unittest.TestCase):
     def test_late_power_results_do_not_restore_cancelled_connection(self):
         station = self.make_controller()
         station.phase = "CONNECTING"
+        station.peripherals.reset()
         station.stop()
+        station.handle("probe", {"type": "power_check", "test": "probe_input_only_firmware", "pass": True, "detail": 1})
+        station.handle("probe", {"type": "power_checked", "pass": True, "count": 1, "checked_us": 10, "uptime_us": 20})
         station.power_ready()
         self.assertEqual(station.phase, "STOPPED")
+        self.assertFalse(station.peripherals.power["probe"])
+        self.assertNotIn("probe", station.peripherals.summaries)
 
     def test_start_during_manual_check_does_not_arm_automatic_output(self):
         station = self.make_controller()

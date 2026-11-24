@@ -139,6 +139,7 @@ class ProtocolTests(unittest.TestCase):
         self.sample(run, "probe", 4); self.sample(run, "source", 4)
         self.assertEqual(run.phase, "STOPPING")
         self.assertNotEqual(run.result.status, "PASS")
+        self.sample(run, "probe", 3, now=4.1, _received_at=1)
         self.confirm_stop(run)
         self.assertEqual(run.phase, "COMPLETE")
         self.assertEqual(run.result.status, "PASS")

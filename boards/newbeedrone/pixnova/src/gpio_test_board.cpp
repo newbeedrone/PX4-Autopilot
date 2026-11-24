@@ -9,6 +9,7 @@
 #include <nuttx/spi/spi.h>
 #include <board_config.h>
 #include <errno.h>
+#include <string.h>
 #include <unistd.h>
 #include "board_self_check.hpp"
 
@@ -27,18 +28,27 @@ constexpr uint8_t BMM150_ADDRESS = 0x10;
 constexpr uint8_t BMP388_ADDRESS = 0x76;
 constexpr uint8_t ICP20100_ADDRESS = 0x63;
 constexpr uint8_t BMM150_CHIP_ID = 0x32;
+constexpr uint8_t BMM150_POWER_CONTROL = 0x4B;
+constexpr uint8_t BMM150_POWER_ON = 0x01;
+constexpr unsigned BMM150_WAKE_US = 3000;
 constexpr uint8_t BMP388_CHIP_ID = 0x50;
 constexpr uint8_t ICP20100_CHIP_ID = 0x63;
+constexpr uint8_t ICP20100_DUMMY_REG = 0x00;
+constexpr uint8_t ICP20100_DEVICE_ID_REG = 0x0C;
+constexpr uint8_t ICP20100_MASTER_LOCK_REG = 0xBE;
+constexpr uint8_t ICP20100_VERSION_REG = 0xD3;
+constexpr uint8_t ICP20100_REVISION_A = 0x00;
+constexpr uint8_t ICP20100_REVISION_B = 0xB2;
 constexpr uint8_t ICM45686_CHIP_ID = 0xE9;
 constexpr uint8_t ICM45686_WHO_AM_I = 0x72;
 constexpr uint8_t SPI_READ = 0x80;
+constexpr uint8_t FRAM_READ_ID = 0x9F;
+constexpr uint8_t FRAM_ID_PREFIX[] = {0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0xC2, 0x22};
+constexpr uint8_t FM25V02_ID_SUFFIX = 0x00;
+constexpr uint8_t FM25V02A_ID_SUFFIX = 0x08;
 
-bool read_register(i2c_master_s *bus, uint8_t address, uint8_t reg, uint8_t &value)
+int read_register(i2c_master_s *bus, uint8_t address, uint8_t reg, uint8_t &value)
 {
-	if (!bus) {
-		return false;
-	}
-
 	i2c_msg_s messages[2] {};
 	messages[0].frequency = messages[1].frequency = I2C_FREQUENCY;
 	messages[0].addr = messages[1].addr = address;
@@ -47,7 +57,7 @@ bool read_register(i2c_master_s *bus, uint8_t address, uint8_t reg, uint8_t &val
 	messages[1].flags = I2C_M_READ;
 	messages[1].buffer = &value;
 	messages[1].length = 1;
-	return I2C_TRANSFER(bus, messages, 2) >= 0;
+	return I2C_TRANSFER(bus, messages, 2);
 }
 
 bool sensor_id(GpioTestReport report, void *context, const char *name, unsigned number, uint8_t address,
@@ -55,27 +65,63 @@ bool sensor_id(GpioTestReport report, void *context, const char *name, unsigned 
 {
 	auto *bus = px4_i2cbus_initialize(number);
 	uint8_t value = 0;
-	bool ok = bus != nullptr;
+	int result = bus ? 0 : -ENODEV;
 
-	if (ok && wake_bmm) {
+	if (bus && wake_bmm) {
 		// BMM150 starts in suspend mode. Enable its power-control bit before reading CHIP_ID.
-		uint8_t command[] = {0x4B, 0x01};
+		uint8_t command[] = {BMM150_POWER_CONTROL, BMM150_POWER_ON};
 		i2c_msg_s message{};
 		message.frequency = I2C_FREQUENCY;
 		message.addr = address;
 		message.buffer = command;
 		message.length = sizeof(command);
-		ok = I2C_TRANSFER(bus, &message, 1) >= 0;
-		usleep(3000);
+		result = I2C_TRANSFER(bus, &message, 1);
+
+		if (result >= 0) { usleep(BMM150_WAKE_US); }
 	}
 
-	ok = ok && read_register(bus, address, reg, value) && value == expected;
+	if (result >= 0) { result = read_register(bus, address, reg, value); }
 
 	if (bus) {
 		px4_i2cbus_uninitialize(bus);
 	}
 
-	report(context, name, ok, value);
+	const bool ok = result >= 0 && value == expected;
+	report(context, name, ok, result < 0 ? result : value);
+	return ok;
+}
+
+bool icp20100_id(GpioTestReport report, void *context)
+{
+	auto *bus = px4_i2cbus_initialize(2);
+	uint8_t id = 0;
+	bool ok = false;
+
+	if (bus) {
+		uint8_t lock_registers[] = {ICP20100_MASTER_LOCK_REG, 0};
+		i2c_msg_s lock{};
+		lock.frequency = I2C_FREQUENCY;
+		lock.addr = ICP20100_ADDRESS;
+		lock.buffer = lock_registers;
+		lock.length = sizeof(lock_registers);
+
+		// DS-000416 §5.4: clock the cold I2C interface before identifying the ASIC.
+		// The clocking writes can NACK before the first usable transaction.
+		I2C_TRANSFER(bus, &lock, 1);
+		I2C_TRANSFER(bus, &lock, 1);
+		uint8_t version = 0;
+		const bool identified = read_register(bus, ICP20100_ADDRESS, ICP20100_DEVICE_ID_REG, id) >= 0
+					&& read_register(bus, ICP20100_ADDRESS, ICP20100_VERSION_REG, version) >= 0;
+
+		// DS-000416 §4.1.3: end the transaction sequence with a read of 0x00.
+		uint8_t dummy = 0;
+		const bool finished = read_register(bus, ICP20100_ADDRESS, ICP20100_DUMMY_REG, dummy) >= 0;
+		ok = identified && finished && id == ICP20100_CHIP_ID
+		     && (version == ICP20100_REVISION_A || version == ICP20100_REVISION_B);
+		px4_i2cbus_uninitialize(bus);
+	}
+
+	report(context, "icp20100_i2c2", ok, id);
 	return ok;
 }
 
@@ -128,25 +174,29 @@ bool empty_external_bus(GpioTestReport report, void *context)
 bool imu_id(GpioTestReport report, void *context, const char *name, unsigned number, uint32_t chip_select)
 {
 	auto *bus = px4_spibus_initialize(number);
-	uint8_t received[2] {};
-	const uint8_t command[2] = {ICM45686_WHO_AM_I | SPI_READ, 0};
-	const uint32_t cs = chip_select | GPIO_OUTPUT | GPIO_PUSHPULL | GPIO_SPEED_2MHz | GPIO_OUTPUT_SET;
-	bool ok = bus != nullptr;
+	int detail = bus ? SPI_LOCK(bus, true) : -ENODEV;
 
-	if (bus) {
-		px4_arch_configgpio(cs);
-		SPI_LOCK(bus, true);
-		SPI_SETFREQUENCY(bus, 1000000);
-		SPI_SETMODE(bus, SPIDEV_MODE3);
-		SPI_SETBITS(bus, 8);
-		px4_arch_gpiowrite(cs, false);
-		SPI_EXCHANGE(bus, command, received, sizeof(received));
-		px4_arch_gpiowrite(cs, true);
+	if (detail >= 0) {
+		const uint32_t cs = chip_select | GPIO_OUTPUT | GPIO_PUSHPULL | GPIO_SPEED_2MHz | GPIO_OUTPUT_SET;
+		detail = px4_arch_configgpio(cs);
+
+		if (detail >= 0) {
+			const uint8_t command[2] = {ICM45686_WHO_AM_I | SPI_READ, 0};
+			uint8_t received[2] {};
+			SPI_SETFREQUENCY(bus, 1000000);
+			SPI_SETMODE(bus, SPIDEV_MODE3);
+			SPI_SETBITS(bus, 8);
+			px4_arch_gpiowrite(cs, false);
+			SPI_EXCHANGE(bus, command, received, sizeof(received));
+			px4_arch_gpiowrite(cs, true);
+			detail = received[1];
+		}
+
 		SPI_LOCK(bus, false);
-		ok = received[1] == ICM45686_CHIP_ID;
 	}
 
-	report(context, name, ok, received[1]);
+	const bool ok = detail == ICM45686_CHIP_ID;
+	report(context, name, ok, detail);
 	return ok;
 }
 
@@ -192,23 +242,24 @@ bool eeprom_read(GpioTestReport report, void *context, const char *name, unsigne
 bool fram_read(GpioTestReport report, void *context)
 {
 	auto *bus = px4_spibus_initialize(5);
-	uint8_t identity[9] {};
+	uint8_t identity[sizeof(FRAM_ID_PREFIX) + 1] {};
 
-	if (bus) {
-		SPI_LOCK(bus, true);
+	if (bus && SPI_LOCK(bus, true) >= 0) {
 		SPI_SETFREQUENCY(bus, 1000000);
 		SPI_SETMODE(bus, SPIDEV_MODE3);
 		SPI_SETBITS(bus, 8);
 		SPI_SELECT(bus, SPIDEV_FLASH(0), true);
-		SPI_SEND(bus, 0x9F); // RAMTRON RDID, followed by six manufacturer bytes and three part bytes.
+		SPI_SEND(bus, FRAM_READ_ID);
 		SPI_RECVBLOCK(bus, identity, sizeof(identity));
 		SPI_SELECT(bus, SPIDEV_FLASH(0), false);
 		SPI_LOCK(bus, false);
 	}
 
-	// Match the FM25V02 / FM25V02A entries in the RAMTRON driver. Read the ID
-	// on every check: geometry is cached, and SPI memory reads always return a length.
-	const bool identified = bus && identity[7] == 0x22 && (identity[8] == 0x00 || identity[8] == 0x08);
+	// Read the full JEDEC manufacturer and device ID on every check. Geometry
+	// is cached, and SPI memory reads can return a length with the chip absent.
+	const uint8_t suffix = identity[sizeof(FRAM_ID_PREFIX)];
+	const bool identified = memcmp(identity, FRAM_ID_PREFIX, sizeof(FRAM_ID_PREFIX)) == 0
+				&& (suffix == FM25V02_ID_SUFFIX || suffix == FM25V02A_ID_SUFFIX);
 	unsigned count = 0;
 	auto **instances = px4_mtd_get_instances(&count);
 	bool ok = false;
@@ -309,7 +360,7 @@ bool board_gpio_test_self_check(GpioTestReport report, void *context, bool check
 #else
 	bool ok = sensor_id(report, context, "bmm150_i2c4", 4, BMM150_ADDRESS, 0x40, BMM150_CHIP_ID, true);
 	ok = sensor_id(report, context, "bmp388_i2c4", 4, BMP388_ADDRESS, 0x00, BMP388_CHIP_ID) && ok;
-	ok = sensor_id(report, context, "icp20100_i2c2", 2, ICP20100_ADDRESS, 0x0C, ICP20100_CHIP_ID) && ok;
+	ok = icp20100_id(report, context) && ok;
 	ok = imu_id(report, context, "icm45686_spi1", 1, GPIO_PORTI | GPIO_PIN9) && ok;
 	ok = imu_id(report, context, "icm45686_spi2", 2, GPIO_PORTH | GPIO_PIN5) && ok;
 	ok = imu_id(report, context, "icm45686_spi3", 3, GPIO_PORTI | GPIO_PIN4) && ok;
