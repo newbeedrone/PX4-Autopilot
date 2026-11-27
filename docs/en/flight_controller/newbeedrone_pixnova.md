@@ -28,6 +28,7 @@ The I/O baseboard provides connectors for peripherals such as GPS receivers, tel
 - Three ICM-45686 IMUs, two barometers, and a BMM150 magnetometer.
 - IMU heating resistors to maintain sensor temperature and reduce temperature-related drift.
 - Redundant power inputs with automatic source selection in the order `POWER1` > `POWER2` > USB.
+- A separately powered [PWM/servo rail](#input-ratings) with a 0–36 V operating range for compatible servos, including high-voltage models.
 - ESD protection on the external interfaces, with overvoltage and undervoltage protection on the baseboard.
 - A 100 Mbps Ethernet interface for communicating with companion computers using MAVLink and applications such as MAVROS.
 - Two CAN buses for DroneCAN/UAVCAN peripherals, including ESCs that report RPM, voltage, and current.
@@ -71,6 +72,7 @@ The IMU board includes heating resistors to maintain sensor temperature in cold 
 - Analogue and digital I/O, including ADC inputs labelled 3.3 V and 6.6 V
 - FMU and I/O debug ports
 - microSD card slot
+- [BOOT button](#boot-button) for firmware programming
 
 ### Operating Temperature
 
@@ -78,7 +80,7 @@ The IMU board includes heating resistors to maintain sensor temperature in cold 
 
 ### Mechanical
 
-- **Weight** 112.33 g
+- **Weight** 112 g
 - **Overall dimensions** 87.70 × 51.30 × 28.91 mm
 - **Inner mounting-hole spacing** 26.5 × 26.5 mm
 - **Outer mounting-hole spacing** 36.7 × 44.0 mm
@@ -167,11 +169,15 @@ Follow [CRSF Telemetry](../telemetry/crsf_telemetry.md) for wiring and the requi
 | -------------------- | -------------------------- | ----------------------------- |
 | `POWER1` / `POWER2`  | 3.8–5.8 V protection range | Regulated 5 V nominal         |
 | USB                  | 4.75–5.25 V                | 5 V nominal                   |
-| PWM/servo power rail | 0–36 V                     | Match the connected actuators |
+| PWM/servo power rail | 0–36 V operating range     | Match the connected actuators |
 
 Both `POWER1` and `POWER2` expose I2C data (`SDA`) and clock (`SCL`) pins for digital power module telemetry.
+
+::: info Servo Power Rail
+The resistive voltage divider on the PWM/servo power rail supports an input range of 0–36 V.
 Power the PWM/servo rail separately from the flight controller supply.
 Apply the actuator supply voltage only to the PWM/servo rail power pins.
+:::
 
 ### Power Protection
 
@@ -194,7 +200,9 @@ The remaining expansion interfaces share a separate 1.5 A current limit.
 
 ### BOOT Button
 
-Use a small tool to press and hold the recessed button for 2 seconds to enter firmware programming mode.
+Before powering the flight controller, use a small tool to press and hold the recessed **BOOT** button.
+Connect USB or apply power while holding the button.
+Release the button 2 seconds after power is applied to enter firmware programming mode.
 
 ## Peripherals
 
@@ -214,6 +222,10 @@ To [build PX4](../dev_setup/building_px4.md) for this target from source:
 ```sh
 make newbeedrone_pixnova_default
 ```
+
+::: info Installing a Local Build
+You can install the resulting `.px4` file using the [custom firmware option](../config/firmware.md#custom) in _QGroundControl_.
+:::
 
 ## Debug Port {#debug_port}
 
